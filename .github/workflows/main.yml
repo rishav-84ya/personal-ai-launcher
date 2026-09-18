@@ -33,11 +33,144 @@ jobs:
         run: |
           kaggle quota --format table || true
 
+      - name: Build private Personal AI secrets dataset
+        env:
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+
+          APP_USERNAME: ${{ secrets.APP_USERNAME }}
+          APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
+
+          E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+        run: |
+          rm -rf /tmp/personal-ai-secrets
+          mkdir -p /tmp/personal-ai-secrets
+
+          python - <<'PY'
+          import json
+          import os
+
+          required = [
+              "SUPABASE_URL",
+              "SUPABASE_SECRET_KEY",
+              "APP_USERNAME",
+              "APP_PASSWORD",
+          ]
+
+          missing = [
+              name
+              for name in required
+              if not os.environ.get(name, "").strip()
+          ]
+
+          if missing:
+              raise SystemExit(
+                  "Missing GitHub Secrets: "
+                  + ", ".join(missing)
+              )
+
+          names = [
+              "SUPABASE_URL",
+              "SUPABASE_SECRET_KEY",
+              "APP_USERNAME",
+              "APP_PASSWORD",
+              "E2B_API_KEY",
+              "HF_TOKEN",
+          ]
+
+          payload = {}
+
+          for name in names:
+              value = os.environ.get(name, "").strip()
+
+              if value:
+                  payload[name] = value
+
+          with open(
+              "/tmp/personal-ai-secrets/secrets.json",
+              "w",
+              encoding="utf-8",
+          ) as f:
+              json.dump(payload, f)
+
+          metadata = {
+              "title": "Personal AI Secrets",
+              "id": "tipsofficial/personal-ai-secrets",
+              "licenses": [
+                  {
+                      "name": "other"
+                  }
+              ],
+              "description":
+                  "Private runtime configuration for Personal AI."
+          }
+
+          with open(
+              "/tmp/personal-ai-secrets/dataset-metadata.json",
+              "w",
+              encoding="utf-8",
+          ) as f:
+              json.dump(
+                  metadata,
+                  f,
+                  indent=2
+              )
+
+          print("✅ Secret bundle created")
+          print(
+              "Keys:",
+              ", ".join(payload.keys())
+          )
+
+          # Never print the values.
+          PY
+
+      - name: Create or update private secrets dataset
+        env:
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+        run: |
+          DATASET="tipsofficial/personal-ai-secrets"
+
+          if kaggle datasets status "$DATASET" >/dev/null 2>&1; then
+
+            echo "Updating existing private secrets dataset..."
+
+            kaggle datasets version \
+              -p /tmp/personal-ai-secrets \
+              -m "Refresh Personal AI runtime secrets" \
+              -q \
+              -t \
+              -r skip
+
+          else
+
+            echo "Creating private secrets dataset..."
+
+            kaggle datasets create \
+              -p /tmp/personal-ai-secrets \
+              -q \
+              -t \
+              -r skip
+
+          fi
+
+          echo "✅ Private secret dataset ready"
+
       - name: Download Personal AI notebook
         env:
           KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
           KAGGLE_KERNEL: ${{ secrets.KAGGLE_KERNEL }}
         run: |
+          echo "================================"
+          echo "Launching:"
+          echo "$KAGGLE_KERNEL"
+          echo "================================"
+
+          rm -rf /tmp/personal-ai
           mkdir -p /tmp/personal-ai
 
           kaggle kernels pull \
@@ -48,27 +181,69 @@ jobs:
           echo "===== Downloaded files ====="
           ls -la /tmp/personal-ai
 
-          echo "===== Original metadata ====="
-          cat /tmp/personal-ai/kernel-metadata.json
-
-      - name: Enable Internet and GPU
+      - name: Configure production notebook
         run: |
           python - <<'PY'
           import json
 
           path = "/tmp/personal-ai/kernel-metadata.json"
 
-          with open(path, "r", encoding="utf-8") as f:
+          with open(
+              path,
+              "r",
+              encoding="utf-8"
+          ) as f:
               data = json.load(f)
 
           data["enable_internet"] = True
           data["enable_gpu"] = True
 
-          with open(path, "w", encoding="utf-8") as f:
-              json.dump(data, f, indent=2)
+          # Important: keep this notebook private because
+          # it uses a private runtime secrets dataset.
+          data["is_private"] = True
 
-          print("===== Updated metadata =====")
-          print(json.dumps(data, indent=2))
+          secret_dataset = (
+              "tipsofficial/personal-ai-secrets"
+          )
+
+          sources = (
+              data.get("dataset_sources")
+              or []
+          )
+
+          if secret_dataset not in sources:
+              sources.append(secret_dataset)
+
+          data["dataset_sources"] = sources
+
+          with open(
+              path,
+              "w",
+              encoding="utf-8"
+          ) as f:
+              json.dump(
+                  data,
+                  f,
+                  indent=2
+              )
+
+          print("===== Production metadata =====")
+          print(
+              json.dumps(
+                  {
+                      "id": data.get("id"),
+                      "enable_internet":
+                          data.get("enable_internet"),
+                      "enable_gpu":
+                          data.get("enable_gpu"),
+                      "is_private":
+                          data.get("is_private"),
+                      "dataset_sources":
+                          data.get("dataset_sources"),
+                  },
+                  indent=2
+              )
+          )
           PY
 
       - name: Start Kaggle notebook
