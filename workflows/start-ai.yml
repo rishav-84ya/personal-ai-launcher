@@ -1,30 +1,4 @@
-name: Start Personal AI
-
-on:
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-jobs:
-  start-ai:
-    runs-on: ubuntu-latest
-
-    steps:
-
-      - name: Install Kaggle CLI
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install --upgrade kaggle
-          kaggle --version
-
-      - name: Verify Kaggle authentication
-        env:
-          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
-        run: |
-          kaggle kernels list --mine --page-size 5
-
-      - name: Download Personal AI notebook
+      - name: Download notebook
         env:
           KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
           KAGGLE_KERNEL: ${{ secrets.KAGGLE_KERNEL }}
@@ -39,14 +13,33 @@ jobs:
           echo "Downloaded files:"
           ls -la /tmp/personal-ai
 
-      - name: Start Kaggle notebook with T4 GPU
+
+      - name: Enable Internet and GPU
+        run: |
+          python - <<'PY'
+          import json
+          import os
+
+          path = "/tmp/personal-ai/kernel-metadata.json"
+
+          with open(path, "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          data["enable_internet"] = True
+          data["enable_gpu"] = True
+
+          with open(path, "w", encoding="utf-8") as f:
+              json.dump(data, f, indent=2)
+
+          print("Updated kernel metadata:")
+          print(json.dumps(data, indent=2))
+          PY
+
+
+      - name: Start Kaggle notebook
         env:
           KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
         run: |
           kaggle kernels push \
             -p /tmp/personal-ai \
             --accelerator NvidiaTeslaT4
-
-      - name: Show completion
-        run: |
-          echo "Kaggle notebook startup request submitted."
