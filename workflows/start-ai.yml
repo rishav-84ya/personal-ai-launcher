@@ -3,10 +3,6 @@ name: Start Personal AI
 on:
   workflow_dispatch:
 
-concurrency:
-  group: personal-ai-kaggle
-  cancel-in-progress: false
-
 jobs:
   start-ai:
     runs-on: ubuntu-latest
@@ -16,29 +12,22 @@ jobs:
         run: |
           python -m pip install --upgrade kaggle
 
-      - name: Download current notebook
+      - name: Download notebook
         env:
           KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
           KAGGLE_KERNEL: ${{ secrets.KAGGLE_KERNEL }}
         run: |
           mkdir -p /tmp/personal-ai
+
           kaggle kernels pull \
             "$KAGGLE_KERNEL" \
             -p /tmp/personal-ai \
             -m
 
-      - name: Start notebook on Kaggle GPU
+      - name: Start Kaggle notebook
         env:
           KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
         run: |
           kaggle kernels push \
             -p /tmp/personal-ai \
             --accelerator NvidiaTeslaT4
-
-      - name: Show status
-        env:
-          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
-          KAGGLE_KERNEL: ${{ secrets.KAGGLE_KERNEL }}
-        run: |
-          sleep 10
-          kaggle kernels status "$KAGGLE_KERNEL" || true
