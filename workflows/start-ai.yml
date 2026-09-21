@@ -2,6 +2,15 @@ name: Start Personal AI
 
 on:
   workflow_dispatch:
+    inputs:
+      kernel_slug:
+        description: "Kaggle kernel owner/slug"
+        required: false
+        default: "tipsofficial/personal-ai-v19"
+      accelerator:
+        description: "Kaggle accelerator"
+        required: false
+        default: "NvidiaTeslaT4"
 
 permissions:
   contents: read
@@ -13,96 +22,208 @@ concurrency:
 jobs:
   start-ai:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      # Preferred: keep using the token secret from your OLD workflow.
+      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+
+      # Optional fallback if you ever switch to legacy credentials.
+      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+      KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
 
     steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Install Kaggle CLI
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install --upgrade kaggle
           kaggle --version
 
-      - name: Verify Kaggle authentication
+      - name: Resolve target
+        id: target
+        shell: bash
         env:
-          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+          INPUT_KERNEL: ${{ inputs.kernel_slug }}
+          INPUT_ACCELERATOR: ${{ inputs.accelerator }}
         run: |
+          set -euo pipefail
+
+          KERNEL_SLUG="${INPUT_KERNEL:-tipsofficial/personal-ai-v19}"
+          ACCELERATOR="${INPUT_ACCELERATOR:-NvidiaTeslaT4}"
+
+          # Fix the common typo automatically.
+          if [[ "$KERNEL_SLUG" == ipsofficial/* ]]; then
+            KERNEL_SLUG="t${KERNEL_SLUG}"
+            echo "::notice::Corrected Kaggle owner typo -> $KERNEL_SLUG"
+          fi
+
+          echo "kernel_slug=$KERNEL_SLUG" >> "$GITHUB_OUTPUT"
+          echo "accelerator=$ACCELERATOR" >> "$GITHUB_OUTPUT"
+
+          echo "Kaggle kernel: $KERNEL_SLUG"
+          echo "Accelerator:   $ACCELERATOR"
+
+      - name: Configure Kaggle authentication
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${KAGGLE_API_TOKEN:-}" ]]; then
+            echo "Using KAGGLE_API_TOKEN."
+          elif [[ -n "${KAGGLE_USERNAME:-}" && -n "${KAGGLE_KEY:-}" ]]; then
+            echo "KAGGLE_API_TOKEN is empty; using legacy username/key."
+            mkdir -p ~/.kaggle
+
+            python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path.home() / ".kaggle" / "kaggle.json"
+          path.write_text(json.dumps({
+              "username": os.environ["KAGGLE_USERNAME"],
+              "key": os.environ["KAGGLE_KEY"],
+          }))
+          path.chmod(0o600)
+          print("Created ~/.kaggle/kaggle.json")
+          PY
+          else
+            echo "::error::Missing Kaggle credentials."
+            echo "::error::Add GitHub secret KAGGLE_API_TOKEN (recommended), or KAGGLE_USERNAME + KAGGLE_KEY."
+            exit 1
+          fi
+
+          # Real authentication test.
           kaggle kernels list --mine --page-size 5
 
       - name: Show Kaggle quota
-        env:
-          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
         run: |
           kaggle quota --format table || true
 
-      - name: Download Personal AI notebook
+      - name: Pull Personal AI notebook and metadata
+        shell: bash
         env:
-          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
-          KAGGLE_KERNEL: ${{ secrets.KAGGLE_KERNEL }}
+          KERNEL_SLUG: ${{ steps.target.outputs.kernel_slug }}
         run: |
+          set -euo pipefail
+
+          rm -rf /tmp/personal-ai
           mkdir -p /tmp/personal-ai
 
           kaggle kernels pull \
-            "$KAGGLE_KERNEL" \
+            "$KERNEL_SLUG" \
             -p /tmp/personal-ai \
             -m
 
           echo "===== Downloaded files ====="
-          ls -la /tmp/personal-ai
+          find /tmp/personal-ai -maxdepth 2 -type f -print
+
+          test -f /tmp/personal-ai/kernel-metadata.json || {
+            echo "::error::kernel-metadata.json was not downloaded."
+            exit 1
+          }
 
           echo "===== Original metadata ====="
           cat /tmp/personal-ai/kernel-metadata.json
 
-      - name: Enable Internet and GPU
+      - name: Enable Internet and T4 x2
+        shell: bash
+        env:
+          ACCELERATOR: ${{ steps.target.outputs.accelerator }}
         run: |
+          set -euo pipefail
+
           python - <<'PY'
           import json
+          import os
+          from pathlib import Path
 
-          path = "/tmp/personal-ai/kernel-metadata.json"
+          root = Path("/tmp/personal-ai")
+          path = root / "kernel-metadata.json"
 
-          with open(path, "r", encoding="utf-8") as f:
-              data = json.load(f)
+          data = json.loads(path.read_text(encoding="utf-8"))
 
+          # Keep Kaggle's existing kernel id / id_no / code_file.
+          # Only change runtime settings.
           data["enable_internet"] = True
           data["enable_gpu"] = True
+          data["machine_shape"] = os.environ["ACCELERATOR"]
 
-          with open(path, "w", encoding="utf-8") as f:
-              json.dump(data, f, indent=2)
+          code_file = data.get("code_file")
+          if not code_file or not (root / code_file).exists():
+              notebooks = sorted(root.glob("*.ipynb"))
+              scripts = sorted(root.glob("*.py"))
+
+              if notebooks:
+                  data["code_file"] = notebooks[0].name
+                  data["kernel_type"] = "notebook"
+              elif scripts:
+                  data["code_file"] = scripts[0].name
+                  data["kernel_type"] = "script"
+              else:
+                  raise SystemExit("No .ipynb or .py file found after kaggle kernels pull.")
+
+          data["language"] = "python"
+
+          path.write_text(
+              json.dumps(data, indent=2) + "\n",
+              encoding="utf-8",
+          )
 
           print("===== Updated metadata =====")
-          print(json.dumps(data, indent=2))
+          print(path.read_text(encoding="utf-8"))
           PY
 
       - name: Start Kaggle notebook
+        shell: bash
         env:
-          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+          ACCELERATOR: ${{ steps.target.outputs.accelerator }}
         run: |
+          set -euo pipefail
+
+          # `kernels push` creates a new version and runs it.
           kaggle kernels push \
             -p /tmp/personal-ai \
-            --accelerator NvidiaTeslaT4
+            --accelerator "$ACCELERATOR"
+
+      - name: Verify Kaggle accepted the run
+        shell: bash
+        env:
+          KERNEL_SLUG: ${{ steps.target.outputs.kernel_slug }}
+        run: |
+          set -euo pipefail
+
+          echo "Polling Kaggle status for: $KERNEL_SLUG"
+
+          for i in {1..18}; do
+            echo "===== Status check $i ====="
+
+            OUT="$(kaggle kernels status "$KERNEL_SLUG" 2>&1 || true)"
+            echo "$OUT"
+
+            if echo "$OUT" | grep -Eiq 'error|failed|cancelled'; then
+              echo "::error::Kaggle reported a failed/cancelled run."
+              exit 1
+            fi
+
+            if echo "$OUT" | grep -Eiq 'running|queued|complete'; then
+              echo "✅ Kaggle accepted the Personal AI run."
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          echo "::warning::Push succeeded, but Kaggle status did not settle during the polling window."
 
       - name: Startup submitted
         run: |
           echo "✅ Personal AI startup submitted to Kaggle"
-
-
-            - name: Download Personal AI notebook
-        env:
-          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
-          KAGGLE_KERNEL: ${{ secrets.KAGGLE_KERNEL }}
-        run: |
-          echo "=================================="
-          echo "Launching Kaggle kernel:"
-          echo "$KAGGLE_KERNEL"
-          echo "=================================="
-
-          mkdir -p /tmp/personal-ai
-
-          kaggle kernels pull \
-            "$KAGGLE_KERNEL" \
-            -p /tmp/personal-ai \
-            -m
-
-          echo "===== Downloaded files ====="
-          ls -la /tmp/personal-ai
-
-          echo "===== Kernel metadata ====="
-          cat /tmp/personal-ai/kernel-metadata.json
+          echo "Kernel: ${{ steps.target.outputs.kernel_slug }}"
+          echo "Accelerator: ${{ steps.target.outputs.accelerator }}"
