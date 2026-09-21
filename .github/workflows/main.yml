@@ -1,0 +1,239 @@
+name: Start Personal AI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: personal-ai-kaggle
+  cancel-in-progress: false
+
+env:
+  # Fixed target: GitHub will NOT ask for a kernel name anymore.
+  KAGGLE_KERNEL: "tipsofficial/notebook-v21"
+
+  # Kaggle's current identifier for GPU T4 x2.
+  KAGGLE_ACCELERATOR: "NvidiaTeslaT4"
+
+jobs:
+  start-ai:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      # IMPORTANT:
+      # This must exist in GitHub:
+      # Settings -> Secrets and variables -> Actions -> Repository secrets
+      #
+      # Kaggle Add-ons -> Secrets is a DIFFERENT secret store and is not
+      # readable by GitHub Actions.
+      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate GitHub Kaggle token
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${KAGGLE_API_TOKEN:-}" ]]; then
+            echo "::error::GitHub Actions secret KAGGLE_API_TOKEN is missing."
+            echo "::error::Add it in GitHub repo -> Settings -> Secrets and variables -> Actions."
+            echo "::error::The KAGGLE_API_TOKEN shown in Kaggle Add-ons -> Secrets cannot be read by GitHub."
+            exit 1
+          fi
+
+          echo "✅ GitHub KAGGLE_API_TOKEN is present"
+          echo "✅ Fixed Kaggle target: ${KAGGLE_KERNEL}"
+
+      - name: Install current Kaggle CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade kaggle
+
+          echo "===== Kaggle CLI ====="
+          kaggle --version
+
+      - name: Verify Kaggle authentication
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # This proves that the token is valid for the account.
+          kaggle kernels list --mine --page-size 5
+
+          echo "✅ Kaggle authentication works"
+
+      - name: Verify target notebook exists
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Target notebook: ${KAGGLE_KERNEL}"
+
+          # Status lookup is a quick target check before downloading anything.
+          kaggle kernels status "${KAGGLE_KERNEL}" || {
+            echo "::error::Could not access ${KAGGLE_KERNEL}."
+            echo "::error::Verify that this exact notebook belongs to the Kaggle account represented by KAGGLE_API_TOKEN."
+            exit 1
+          }
+
+          echo "✅ Target notebook exists"
+
+      - name: Pull exact notebook and metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORK_DIR="${RUNNER_TEMP}/personal-ai"
+          rm -rf "${WORK_DIR}"
+          mkdir -p "${WORK_DIR}"
+
+          kaggle kernels pull \
+            "${KAGGLE_KERNEL}" \
+            -p "${WORK_DIR}" \
+            -m
+
+          echo "===== Pulled files ====="
+          find "${WORK_DIR}" -maxdepth 2 -type f -print
+
+          test -f "${WORK_DIR}/kernel-metadata.json" || {
+            echo "::error::Kaggle did not return kernel-metadata.json."
+            exit 1
+          }
+
+          echo "WORK_DIR=${WORK_DIR}" >> "${GITHUB_ENV}"
+
+      - name: Force notebook-v21 runtime settings
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["WORK_DIR"])
+          metadata_path = root / "kernel-metadata.json"
+
+          metadata = json.loads(
+              metadata_path.read_text(encoding="utf-8")
+          )
+
+          target = os.environ["KAGGLE_KERNEL"]
+          accelerator = os.environ["KAGGLE_ACCELERATOR"]
+
+          # Keep id_no if Kaggle returned it; Kaggle prefers id_no for an
+          # existing notebook. Also pin id to the exact intended notebook.
+          metadata["id"] = target
+
+          code_file = metadata.get("code_file")
+
+          if not code_file or not (root / code_file).is_file():
+              notebooks = sorted(root.glob("*.ipynb"))
+              scripts = sorted(root.glob("*.py"))
+
+              if notebooks:
+                  code_file = notebooks[0].name
+                  metadata["kernel_type"] = "notebook"
+              elif scripts:
+                  code_file = scripts[0].name
+                  metadata["kernel_type"] = "script"
+              else:
+                  raise SystemExit(
+                      "No notebook/script was pulled from Kaggle."
+                  )
+
+              metadata["code_file"] = code_file
+
+          metadata["language"] = "python"
+          metadata["enable_internet"] = True
+          metadata["enable_gpu"] = True
+          metadata["machine_shape"] = accelerator
+
+          # Do not overwrite title, id_no, data sources, model sources,
+          # kernel sources, or privacy settings from the existing notebook.
+          metadata_path.write_text(
+              json.dumps(metadata, indent=2) + "\n",
+              encoding="utf-8",
+          )
+
+          print("===== Updated kernel metadata =====")
+          print(metadata_path.read_text(encoding="utf-8"))
+
+          print("===== Code file =====")
+          print(code_file)
+          print("exists =", (root / code_file).is_file())
+          PY
+
+      - name: Trigger notebook-v21 on Kaggle T4 x2
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "🚀 Starting ${KAGGLE_KERNEL}"
+          echo "GPU: ${KAGGLE_ACCELERATOR}"
+
+          # IMPORTANT: no --timeout here.
+          # A timeout would limit the lifetime of the long-running AI server.
+          #
+          # Official Kaggle behavior:
+          # `kernels push` uploads a new version and runs it.
+          kaggle kernels push \
+            -p "${WORK_DIR}" \
+            --accelerator "${KAGGLE_ACCELERATOR}"
+
+          echo "✅ Kaggle accepted the push command"
+
+      - name: Confirm Kaggle accepted the run
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Polling: ${KAGGLE_KERNEL}"
+
+          for i in {1..18}; do
+            echo "===== status check ${i}/18 ====="
+
+            OUT="$(kaggle kernels status "${KAGGLE_KERNEL}" 2>&1 || true)"
+            echo "${OUT}"
+
+            if echo "${OUT}" | grep -Eiq 'error|failed|failure|cancelled|canceled'; then
+              echo "::error::Kaggle reported a failed/cancelled notebook run."
+              exit 1
+            fi
+
+            if echo "${OUT}" | grep -Eiq 'running|queued|pending'; then
+              echo "✅ Kaggle notebook is queued/running."
+              exit 0
+            fi
+
+            # A server notebook normally stays running. If Kaggle reports
+            # COMPLETE immediately, the trigger worked but the notebook exited.
+            if echo "${OUT}" | grep -Eiq 'complete|completed'; then
+              echo "::warning::Kaggle accepted the run, but notebook-v21 already completed."
+              echo "::warning::Check its Kaggle output/log because the AI server should normally stay running."
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          echo "::warning::The push succeeded, but Kaggle status did not settle during this polling window."
+          exit 0
+
+      - name: Startup submitted
+        run: |
+          echo "✅ Personal AI wake request submitted"
+          echo "Notebook: ${KAGGLE_KERNEL}"
+          echo "Accelerator: ${KAGGLE_ACCELERATOR}"
