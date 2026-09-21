@@ -10,22 +10,20 @@ concurrency:
   group: personal-ai-kaggle
   cancel-in-progress: false
 
-env:
-  # Fixed notebook. GitHub will NOT ask for a kernel name.
-  KAGGLE_KERNEL: "tipsofficial/notebook-v21"
-
-  # Kaggle identifier for T4 x2.
-  KAGGLE_ACCELERATOR: "NvidiaTeslaT4"
-
 jobs:
   start-ai:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     env:
-      # Must be stored in GitHub:
-      # Repo -> Settings -> Secrets and variables -> Actions
+      # GitHub Repository Secrets:
+      # KAGGLE_API_TOKEN = Kaggle API token
+      # KAGGLE_KERNEL    = owner/slug, e.g. tipsofficial/notebook-v21
       KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+      KAGGLE_KERNEL: ${{ secrets.KAGGLE_KERNEL }}
+
+      # Fixed hardware choice; no workflow input is shown.
+      KAGGLE_ACCELERATOR: "NvidiaTeslaT4"
 
     steps:
       - name: Set up Python
@@ -33,48 +31,48 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Validate GitHub Kaggle token
+      - name: Validate launcher secrets
         shell: bash
         run: |
           set -euo pipefail
 
           if [[ -z "${KAGGLE_API_TOKEN:-}" ]]; then
-            echo "::error::Missing GitHub Actions secret KAGGLE_API_TOKEN."
-            echo "::error::Kaggle Add-ons -> Secrets is a different secret store."
+            echo "::error::Missing GitHub Repository Secret: KAGGLE_API_TOKEN"
             exit 1
           fi
 
-          echo "✅ GitHub KAGGLE_API_TOKEN is present"
-          echo "✅ Fixed target: ${KAGGLE_KERNEL}"
+          if [[ -z "${KAGGLE_KERNEL:-}" ]]; then
+            echo "::error::Missing GitHub Repository Secret: KAGGLE_KERNEL"
+            echo "::error::Set it to owner/slug only, for example: tipsofficial/notebook-v21"
+            exit 1
+          fi
 
-      - name: Install current Kaggle CLI
+          if [[ ! "${KAGGLE_KERNEL}" =~ ^[^/]+/[^/]+$ ]]; then
+            echo "::error::KAGGLE_KERNEL must be owner/slug, not a full Kaggle URL."
+            echo "::error::Example: tipsofficial/notebook-v21"
+            exit 1
+          fi
+
+          echo "✅ Kaggle token is present"
+          echo "✅ Target kernel: ${KAGGLE_KERNEL}"
+          echo "✅ Accelerator: ${KAGGLE_ACCELERATOR}"
+
+      - name: Install Kaggle CLI
         shell: bash
         run: |
           set -euo pipefail
-
           python -m pip install --upgrade pip
           python -m pip install --upgrade kaggle
-
-          echo "===== Kaggle CLI ====="
           kaggle --version
 
       - name: Verify Kaggle authentication
         shell: bash
         run: |
           set -euo pipefail
-
-          echo "===== Kernels visible to this token ====="
           kaggle kernels list --mine --page-size 20
-
           echo "✅ Kaggle authentication works"
 
-      # IMPORTANT:
-      # Do NOT run `kaggle kernels status` here.
-      # A draft / quick-saved notebook can return 404 from GetKernelSessionStatus
-      # before there is a real run session, even though the notebook/version exists.
-      #
-      # `kernels pull` is the correct existence/source check for this workflow.
-      - name: Pull notebook-v21 and metadata
+      - name: Pull configured notebook
         shell: bash
         run: |
           set -euo pipefail
@@ -83,37 +81,15 @@ jobs:
           rm -rf "${WORK_DIR}"
           mkdir -p "${WORK_DIR}"
 
-          echo "Pulling exact notebook: ${KAGGLE_KERNEL}"
+          echo "Pulling: ${KAGGLE_KERNEL}"
 
-          set +e
-          PULL_OUTPUT="$(
-            kaggle kernels pull \
-              "${KAGGLE_KERNEL}" \
-              -p "${WORK_DIR}" \
-              -m \
-              2>&1
-          )"
-          PULL_CODE=$?
-          set -e
-
-          echo "${PULL_OUTPUT}"
-
-          if [[ "${PULL_CODE}" -ne 0 ]]; then
-            if echo "${PULL_OUTPUT}" | grep -Eiq '404|not found'; then
-              echo ""
-              echo "::error::Kaggle API cannot pull ${KAGGLE_KERNEL} yet."
-              echo "::error::Your screenshot shows 'Save Version 0', which means the notebook is still draft-only."
-              echo "::error::Open notebook-v21 in Kaggle and click Save Version ONCE."
-              echo "::error::After Kaggle shows Version 1 (or higher), run this GitHub workflow again."
-              echo "::error::Do NOT create another notebook and do NOT change the slug."
-            else
-              echo "::error::Kaggle pull failed. Check the output above."
-            fi
-            exit "${PULL_CODE}"
-          fi
+          kaggle kernels pull \
+            "${KAGGLE_KERNEL}" \
+            -p "${WORK_DIR}" \
+            -m
 
           test -f "${WORK_DIR}/kernel-metadata.json" || {
-            echo "::error::kernel-metadata.json was not downloaded."
+            echo "::error::kernel-metadata.json was not returned."
             exit 1
           }
 
@@ -122,9 +98,7 @@ jobs:
           echo "===== Pulled files ====="
           find "${WORK_DIR}" -maxdepth 2 -type f -print
 
-          echo "✅ Existing Kaggle version is accessible through the API"
-
-      - name: Force Internet and T4 x2
+      - name: Preserve notebook identity and force T4 x2
         shell: bash
         run: |
           set -euo pipefail
@@ -135,14 +109,16 @@ jobs:
           from pathlib import Path
 
           root = Path(os.environ["WORK_DIR"])
-          path = root / "kernel-metadata.json"
+          meta_path = root / "kernel-metadata.json"
 
-          data = json.loads(path.read_text(encoding="utf-8"))
+          meta = json.loads(
+              meta_path.read_text(encoding="utf-8")
+          )
 
-          # Pin the intended existing notebook.
-          data["id"] = os.environ["KAGGLE_KERNEL"]
+          # Keep/update the exact owner/slug supplied by GitHub secret.
+          meta["id"] = os.environ["KAGGLE_KERNEL"]
 
-          code_file = data.get("code_file")
+          code_file = meta.get("code_file")
 
           if not code_file or not (root / code_file).is_file():
               notebooks = sorted(root.glob("*.ipynb"))
@@ -150,41 +126,37 @@ jobs:
 
               if notebooks:
                   code_file = notebooks[0].name
-                  data["kernel_type"] = "notebook"
+                  meta["kernel_type"] = "notebook"
               elif scripts:
                   code_file = scripts[0].name
-                  data["kernel_type"] = "script"
+                  meta["kernel_type"] = "script"
               else:
                   raise SystemExit(
-                      "No .ipynb or .py file was returned by Kaggle."
+                      "No .ipynb or .py file was pulled."
                   )
 
-              data["code_file"] = code_file
+              meta["code_file"] = code_file
 
-          data["language"] = "python"
-          data["enable_internet"] = True
-          data["enable_gpu"] = True
-          data["machine_shape"] = os.environ["KAGGLE_ACCELERATOR"]
+          meta["language"] = "python"
+          meta["enable_internet"] = True
+          meta["enable_gpu"] = True
+          meta["machine_shape"] = os.environ["KAGGLE_ACCELERATOR"]
 
-          # Preserve id_no, privacy and attached data/model sources returned
-          # by Kaggle. They identify/update the existing notebook version.
-          path.write_text(
-              json.dumps(data, indent=2) + "\n",
+          # Preserve Kaggle-returned id_no, privacy, dataset/model source fields, etc.
+          meta_path.write_text(
+              json.dumps(meta, indent=2) + "\n",
               encoding="utf-8",
           )
 
-          print("===== Final metadata =====")
-          print(path.read_text(encoding="utf-8"))
-          print("Code file:", code_file)
+          print(meta_path.read_text(encoding="utf-8"))
           PY
 
-      - name: Trigger notebook-v21
+      - name: Trigger configured Kaggle notebook
         shell: bash
         run: |
           set -euo pipefail
 
           echo "🚀 Triggering ${KAGGLE_KERNEL}"
-          echo "Accelerator: ${KAGGLE_ACCELERATOR}"
 
           kaggle kernels push \
             -p "${WORK_DIR}" \
@@ -192,7 +164,6 @@ jobs:
 
           echo "✅ Kaggle push accepted"
 
-      # Status is checked only AFTER push, when a run session should exist.
       - name: Confirm Kaggle run
         shell: bash
         run: |
@@ -213,20 +184,19 @@ jobs:
             fi
 
             if echo "${OUT}" | grep -Eiq 'running|queued|pending'; then
-              echo "✅ Personal AI notebook is queued/running."
+              echo "✅ Personal AI is queued/running."
               exit 0
             fi
 
             if echo "${OUT}" | grep -Eiq 'complete|completed'; then
-              echo "::warning::Notebook run completed already."
-              echo "::warning::If Personal AI should stay online, inspect the Kaggle notebook output."
+              echo "::warning::Notebook already completed. Check its Kaggle output."
               exit 0
             fi
 
             sleep 10
           done
 
-          echo "::warning::Push succeeded but status did not settle inside the polling window."
+          echo "::warning::Push succeeded but status did not settle in the polling window."
           exit 0
 
       - name: Startup submitted
