@@ -16,20 +16,22 @@ jobs:
     timeout-minutes: 20
 
     env:
-      # GitHub Repository Secrets:
-      # KAGGLE_API_TOKEN = Kaggle API token
+      # GitHub Repository Secrets
+      # KAGGLE_API_TOKEN = Kaggle API token for the OWNER of the notebook
       # KAGGLE_KERNEL    = owner/slug, e.g. tipsofficial/notebook-v21
       KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
       KAGGLE_KERNEL: ${{ secrets.KAGGLE_KERNEL }}
 
-      # Private Kaggle dataset containing secrets.json.
-      # This dataset must be PRIVATE and accessible to the Kaggle account
-      # that owns KAGGLE_KERNEL.
+      # This is ONLY used to verify that the EXISTING Kaggle notebook
+      # already has the private dataset attached.
       #
-      # If your dataset owner/slug is different, change this one value.
+      # IMPORTANT:
+      # We deliberately DO NOT run `kaggle datasets files` here.
+      # That call requires the GitHub-side Kaggle identity to have
+      # dataset permission and was the direct cause of the 403.
       KAGGLE_SECRET_DATASET: "tipsofficial/personal-ai-secrets"
 
-      # Kaggle T4 x2 machine shape.
+      # Fixed hardware choice.
       KAGGLE_ACCELERATOR: "NvidiaTeslaT4"
 
     steps:
@@ -38,7 +40,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Validate launcher secrets and configuration
+      - name: Validate launcher configuration
         shell: bash
         run: |
           set -euo pipefail
@@ -56,7 +58,6 @@ jobs:
 
           if [[ ! "${KAGGLE_KERNEL}" =~ ^[^/]+/[^/]+$ ]]; then
             echo "::error::KAGGLE_KERNEL must be owner/slug, not a full Kaggle URL."
-            echo "::error::Example: tipsofficial/notebook-v21"
             exit 1
           fi
 
@@ -67,7 +68,7 @@ jobs:
 
           echo "✅ Kaggle token is present"
           echo "✅ Target kernel: ${KAGGLE_KERNEL}"
-          echo "✅ Private secret dataset: ${KAGGLE_SECRET_DATASET}"
+          echo "✅ Expected private dataset attachment: ${KAGGLE_SECRET_DATASET}"
           echo "✅ Accelerator: ${KAGGLE_ACCELERATOR}"
 
       - name: Install Kaggle CLI
@@ -83,27 +84,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          kaggle kernels list --mine --page-size 20 >/tmp/kaggle-kernels.txt
-          cat /tmp/kaggle-kernels.txt
+          kaggle kernels list --mine --page-size 20
 
           echo "✅ Kaggle authentication works"
 
-      - name: Verify private secret dataset access
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "Checking access to private dataset: ${KAGGLE_SECRET_DATASET}"
-
-          # This verifies that the GitHub-side Kaggle identity can see the
-          # dataset. The dataset itself remains private.
-          kaggle datasets files \
-            -d "${KAGGLE_SECRET_DATASET}" \
-            --page-size 20
-
-          echo "✅ Private secret dataset is accessible"
-
-      - name: Pull configured notebook
+      - name: Pull existing Kaggle notebook
         shell: bash
         run: |
           set -euo pipefail
@@ -112,7 +97,7 @@ jobs:
           rm -rf "${WORK_DIR}"
           mkdir -p "${WORK_DIR}"
 
-          echo "Pulling: ${KAGGLE_KERNEL}"
+          echo "Pulling existing kernel: ${KAGGLE_KERNEL}"
 
           kaggle kernels pull \
             "${KAGGLE_KERNEL}" \
@@ -129,7 +114,7 @@ jobs:
           echo "===== Pulled files ====="
           find "${WORK_DIR}" -maxdepth 2 -type f -print
 
-      - name: Preserve notebook identity and attach private secret dataset
+      - name: Preserve existing Kaggle attachments and force T4
         shell: bash
         run: |
           set -euo pipefail
@@ -146,7 +131,7 @@ jobs:
               meta_path.read_text(encoding="utf-8")
           )
 
-          # Keep the exact owner/slug supplied by the GitHub secret.
+          # Keep the exact kernel identity supplied by GitHub.
           meta["id"] = os.environ["KAGGLE_KERNEL"]
 
           code_file = meta.get("code_file")
@@ -162,9 +147,7 @@ jobs:
                   code_file = scripts[0].name
                   meta["kernel_type"] = "script"
               else:
-                  raise SystemExit(
-                      "No .ipynb or .py file was pulled."
-                  )
+                  raise SystemExit("No .ipynb or .py file was pulled.")
 
               meta["code_file"] = code_file
 
@@ -173,17 +156,13 @@ jobs:
           meta["enable_gpu"] = True
           meta["machine_shape"] = os.environ["KAGGLE_ACCELERATOR"]
 
-          # ----------------------------------------------------------
-          # CRITICAL FIX:
+          # CRITICAL:
+          # Do NOT add/remove dataset_sources here.
           #
-          # Kaggle UI Secrets are not a reliable transport mechanism
-          # for a GitHub -> Kaggle triggered execution. The notebook
-          # therefore reads secrets.json from a private Kaggle dataset.
-          #
-          # Attach the dataset to the kernel metadata before pushing.
-          # ----------------------------------------------------------
-          secret_dataset = os.environ["KAGGLE_SECRET_DATASET"]
-
+          # The notebook was already configured in Kaggle manually.
+          # kaggle kernels pull returns its current dataset_sources.
+          # We preserve those sources exactly so the private
+          # personal-ai-secrets dataset remains attached.
           sources = meta.get("dataset_sources", [])
 
           if sources is None:
@@ -193,36 +172,46 @@ jobs:
           elif not isinstance(sources, list):
               sources = list(sources)
 
-          sources = [
-              str(item).strip()
-              for item in sources
-              if str(item).strip()
-          ]
+          clean_sources = []
+          for item in sources:
+              item = str(item).strip()
+              if item and item not in clean_sources:
+                  clean_sources.append(item)
 
-          if secret_dataset not in sources:
-              sources.append(secret_dataset)
+          meta["dataset_sources"] = clean_sources
 
-          meta["dataset_sources"] = sources
+          expected = os.environ["KAGGLE_SECRET_DATASET"]
 
-          # Keep any other Kaggle-returned metadata intact:
-          # privacy, id_no, model sources, competition sources, etc.
+          print("===== Existing Kaggle dataset attachments =====")
+          for item in clean_sources:
+              print("  -", item)
+
+          if expected not in clean_sources:
+              raise SystemExit(
+                  "\nERROR: The existing Kaggle notebook does not report "
+                  f"the required private dataset '{expected}' in "
+                  "kernel-metadata.json.\n\n"
+                  "Attach that PRIVATE dataset to the notebook once in "
+                  "the Kaggle UI, save the notebook, then run this "
+                  "workflow again.\n\n"
+                  "The GitHub runner intentionally does not call "
+                  "'kaggle datasets files' and does not attempt to "
+                  "grant/access a private dataset."
+              )
 
           meta_path.write_text(
               json.dumps(meta, indent=2) + "\n",
               encoding="utf-8",
           )
 
-          print("===== Final Kaggle metadata =====")
-          print(meta_path.read_text(encoding="utf-8"))
-
-          print("=================================")
-          print("✅ Secret dataset attached:", secret_dataset)
-          print("✅ Machine shape:", meta["machine_shape"])
+          print("==============================================")
+          print("✅ Existing private dataset attachment preserved")
           print("✅ Kernel:", meta["id"])
           print("✅ Code file:", meta["code_file"])
+          print("✅ Machine:", meta["machine_shape"])
           PY
 
-      - name: Validate pushed notebook metadata
+      - name: Validate final Kaggle metadata
         shell: bash
         run: |
           set -euo pipefail
@@ -235,41 +224,38 @@ jobs:
           path = Path(os.environ["WORK_DIR"]) / "kernel-metadata.json"
           meta = json.loads(path.read_text(encoding="utf-8"))
 
-          kernel = meta.get("id")
-          machine = meta.get("machine_shape")
+          if meta.get("id") != os.environ["KAGGLE_KERNEL"]:
+              raise SystemExit(
+                  f"Kernel identity mismatch: {meta.get('id')!r}"
+              )
+
+          if meta.get("machine_shape") != os.environ["KAGGLE_ACCELERATOR"]:
+              raise SystemExit(
+                  f"Machine shape mismatch: {meta.get('machine_shape')!r}"
+              )
+
           datasets = meta.get("dataset_sources") or []
-
-          if kernel != os.environ["KAGGLE_KERNEL"]:
-              raise SystemExit(
-                  f"Kernel identity mismatch: {kernel!r}"
-              )
-
-          if machine != os.environ["KAGGLE_ACCELERATOR"]:
-              raise SystemExit(
-                  f"Machine shape mismatch: {machine!r}"
-              )
 
           if os.environ["KAGGLE_SECRET_DATASET"] not in datasets:
               raise SystemExit(
-                  "Private secret dataset was not attached to "
-                  "kernel-metadata.json"
+                  "Required private dataset is not attached."
               )
 
           print("✅ Metadata validation passed")
-          print("Kernel:", kernel)
-          print("Machine:", machine)
-          print("Secret dataset attached:", os.environ["KAGGLE_SECRET_DATASET"])
+          print("Kernel:", meta["id"])
+          print("Machine:", meta["machine_shape"])
+          print("Private dataset attachment: present")
           PY
 
-      - name: Trigger configured Kaggle notebook
+      - name: Push existing notebook back to Kaggle
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "🚀 Triggering ${KAGGLE_KERNEL}"
+          echo "🚀 Starting ${KAGGLE_KERNEL}"
 
-          # machine_shape is already written into kernel-metadata.json.
-          # Do not pass a second accelerator override to the CLI.
+          # No --accelerator flag here.
+          # machine_shape is already in kernel-metadata.json.
           kaggle kernels push \
             -p "${WORK_DIR}"
 
@@ -303,7 +289,7 @@ jobs:
 
             if echo "${OUT}" | grep -Eiq \
               'complete|completed'; then
-              echo "::warning::Notebook already completed. Check its Kaggle output."
+              echo "::warning::Notebook already completed. Check Kaggle output."
               exit 0
             fi
 
@@ -317,5 +303,5 @@ jobs:
         run: |
           echo "✅ Personal AI wake request submitted"
           echo "Notebook: ${KAGGLE_KERNEL}"
-          echo "Private secret dataset: ${KAGGLE_SECRET_DATASET}"
+          echo "Private dataset attachment: verified from kernel metadata"
           echo "Accelerator: ${KAGGLE_ACCELERATOR}"
