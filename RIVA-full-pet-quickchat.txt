@@ -1,0 +1,1325 @@
+/**
+ * RIVA — Rishav Intelligent Virtual Assistant
+ * Cloudflare Worker — API + floating Pet + Quick Chat edition
+ *
+ * Required Worker secrets/vars:
+ *   SUPABASE_URL
+ *   SUPABASE_SECRET_KEY
+ *
+ * Optional:
+ *   STATE_ID              default: main_ai
+ *   RIVA_API_KEY          Bearer key for public API protection
+ *   RIVA_CORS_ORIGIN      e.g. https://your-frontend.pages.dev
+ *                         or "*" for a public API
+ *   GRADIO_USERNAME
+ *   GRADIO_PASSWORD
+ *
+ * Supabase tables used:
+ *   app_state(id, current_url, desired_state, status)
+ *   gradio_urls(id, url)                  fallback only
+ *   chat_messages(id, conversation_id, role, content, created_at)
+ *
+ * No HTML, CSS, browser JavaScript, DOM APIs, Node.js APIs, or UI are used.
+ */
+
+const DEFAULT_STATE_ID = "main_ai";
+const MAX_BODY_BYTES = 512 * 1024;
+const GRADIO_START_TIMEOUT_MS = 20_000;
+const GRADIO_STREAM_TIMEOUT_MS = 120_000;
+const GRADIO_PING_TIMEOUT_MS = 5_000;
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const cfg = {
+      stateId: env.STATE_ID || DEFAULT_STATE_ID,
+      supabaseUrl: String(env.SUPABASE_URL || "").replace(/\/+$/, ""),
+      supabaseKey: env.SUPABASE_SECRET_KEY || "",
+      gradioUsername: env.GRADIO_USERNAME || "",
+      gradioPassword: env.GRADIO_PASSWORD || "",
+      apiKey: env.RIVA_API_KEY || "",
+      corsOrigin: env.RIVA_CORS_ORIGIN || "*",
+    };
+
+    try {
+      if (request.method === "OPTIONS") {
+        return withCors(new Response(null, { status: 204 }), cfg);
+      }
+
+      // Always keep a lightweight health endpoint for Cloudflare health checks.
+      if (url.pathname === "/health") {
+        return withCors(json({
+          ok: true,
+          service: "riva-worker",
+          version: "5.1-pet-quickchat",
+          ui: false,
+          timestamp: new Date().toISOString(),
+        }), cfg);
+      }
+
+      // OpenAI-compatible API.
+      if (url.pathname === "/v1/models" || url.pathname === "/v1/chat/completions") {
+        return await handleOpenAI(request, url, cfg);
+      }
+
+      // Native RIVA API for simple clients.
+      if (url.pathname.startsWith("/api/")) {
+        return await handleApi(request, url, cfg);
+      }
+
+      // Lightweight RIVA pet + secondary quick-chat window.
+      if (url.pathname === "/" || url.pathname === "/index.html" || url.pathname === "/quick") {
+        return new Response(UI, {
+          headers: {
+            "content-type": "text/html; charset=utf-8",
+            "cache-control": "no-store",
+            "x-content-type-options": "nosniff",
+          },
+        });
+      }
+
+      return withCors(json({
+        ok: true,
+        service: "RIVA",
+        version: "5.1-pet-quickchat",
+        ui: "/",
+        endpoints: {
+          health: "/health",
+          models: "/v1/models",
+          chat: "/v1/chat/completions",
+          state: "/api/state",
+          nativeChat: "/api/chat",
+          conversations: "/api/conversations",
+        },
+      }), cfg);
+    } catch (err) {
+      console.error("Unhandled RIVA Worker error:", err);
+      return withCors(json({
+        error: {
+          message: "Internal server error.",
+          type: "server_error",
+        },
+      }, 500), cfg);
+    }
+  },
+};
+
+function json(data, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      ...extraHeaders,
+    },
+  });
+}
+
+function withCors(response, cfg) {
+  const h = new Headers(response.headers);
+  const origin = cfg.corsOrigin || "*";
+
+  h.set("access-control-allow-origin", origin);
+  h.set("access-control-allow-methods", "GET,POST,DELETE,OPTIONS");
+  h.set(
+    "access-control-allow-headers",
+    "Authorization,Content-Type,Accept,Cache-Control"
+  );
+  h.set("access-control-max-age", "86400");
+  h.set("vary", "Origin");
+  h.set("x-content-type-options", "nosniff");
+  h.set("referrer-policy", "no-referrer");
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: h,
+  });
+}
+
+function requireApiKey(request, cfg) {
+  if (!cfg.apiKey) return null;
+
+  const auth = request.headers.get("authorization") || "";
+  if (auth !== `Bearer ${cfg.apiKey}`) {
+    return json({
+      error: {
+        message: "Unauthorized.",
+        type: "authentication_error",
+        code: "invalid_api_key",
+      },
+    }, 401);
+  }
+
+  return null;
+}
+
+async function readJson(request, maxBytes = MAX_BODY_BYTES) {
+  const contentLength = Number(request.headers.get("content-length") || 0);
+  if (contentLength > maxBytes) {
+    throw new Error("Request body too large.");
+  }
+
+  const text = await request.text();
+
+  if (new TextEncoder().encode(text).byteLength > maxBytes) {
+    throw new Error("Request body too large.");
+  }
+
+  if (!text.trim()) return {};
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error("Invalid JSON.");
+  }
+}
+
+function safeId(value) {
+  return encodeURIComponent(String(value || ""));
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 30_000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: options.signal || controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function supabase(cfg, path, {
+  method = "GET",
+  body,
+  headers = {},
+} = {}) {
+  if (!cfg.supabaseUrl || !cfg.supabaseKey) {
+    throw new Error(
+      "SUPABASE_URL and SUPABASE_SECRET_KEY are required."
+    );
+  }
+
+  const response = await fetchWithTimeout(
+    `${cfg.supabaseUrl}/rest/v1/${path}`,
+    {
+      method,
+      headers: {
+        apikey: cfg.supabaseKey,
+        Authorization: `Bearer ${cfg.supabaseKey}`,
+        "content-type": "application/json",
+        Prefer: method === "GET" ? "" : "return=representation",
+        ...headers,
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    },
+    20_000
+  );
+
+  if (!response.ok) {
+    const bodyText = await response.text().catch(() => "");
+    throw new Error(
+      `Supabase ${response.status}: ${bodyText.slice(0, 500)}`
+    );
+  }
+
+  const text = await response.text();
+  if (!text) return null;
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error("Supabase returned invalid JSON.");
+  }
+}
+
+function gradioHeaders(cfg, accept = "application/json") {
+  const headers = new Headers({ accept });
+
+  if (cfg.gradioUsername || cfg.gradioPassword) {
+    headers.set(
+      "authorization",
+      `Basic ${btoa(`${cfg.gradioUsername}:${cfg.gradioPassword}`)}`
+    );
+  }
+
+  return headers;
+}
+
+async function getRuntime(cfg) {
+  let state = {};
+
+  try {
+    const rows = await supabase(
+      cfg,
+      `app_state?select=current_url,desired_state,status&id=eq.${safeId(cfg.stateId)}&limit=1`
+    );
+    state = rows?.[0] || {};
+  } catch (err) {
+    console.error("Could not read app_state:", err);
+  }
+
+  let base = String(state.current_url || "").trim().replace(/\/+$/, "");
+
+  // Fallback for installations that still use gradio_urls.
+  if (!base) {
+    try {
+      const rows = await supabase(
+        cfg,
+        "gradio_urls?select=url&id=eq.1&limit=1"
+      );
+      base = String(rows?.[0]?.url || "").trim().replace(/\/+$/, "");
+    } catch (err) {
+      console.error("Could not read gradio_urls:", err);
+    }
+  }
+
+  return {
+    base,
+    status: state.status || null,
+    desiredState: state.desired_state || null,
+  };
+}
+
+async function pingGradio(base, cfg) {
+  if (!base) {
+    return {
+      live: false,
+      reason: "no-url",
+      url: null,
+      latencyMs: null,
+    };
+  }
+
+  const clean = base.replace(/\/+$/, "");
+  const started = Date.now();
+  let lastStatus = null;
+
+  for (const path of ["/gradio_api/info", "/info"]) {
+    try {
+      const response = await fetchWithTimeout(
+        clean + path,
+        { headers: gradioHeaders(cfg) },
+        GRADIO_PING_TIMEOUT_MS
+      );
+
+      lastStatus = response.status;
+
+      if (response.ok) {
+        return {
+          live: true,
+          url: clean,
+          latencyMs: Date.now() - started,
+          endpoint: path,
+        };
+      }
+    } catch {
+      // Try the next Gradio info endpoint.
+    }
+  }
+
+  return {
+    live: false,
+    reason: lastStatus ? `http-${lastStatus}` : "unreachable",
+    url: clean,
+    latencyMs: Date.now() - started,
+  };
+}
+
+/*
+ * Gradio frontend_chat bridge.
+ *
+ * Current RIVA/Kaggle Gradio contract:
+ * POST /gradio_api/call/frontend_chat
+ * { data: [message, modelSelection, false, conversationId] }
+ *
+ * Then:
+ * GET /gradio_api/call/frontend_chat/:event_id
+ */
+async function startGradioCall(
+  base,
+  message,
+  cfg,
+  conversationId,
+  modelSelection
+) {
+  const clean = String(base || "").replace(/\/+$/, "");
+  if (!clean) throw new Error("RIVA is offline: no Gradio URL.");
+
+  const response = await fetchWithTimeout(
+    `${clean}/gradio_api/call/frontend_chat`,
+    {
+      method: "POST",
+      headers: new Headers({
+        ...Object.fromEntries(gradioHeaders(cfg)),
+        "content-type": "application/json",
+      }),
+      body: JSON.stringify({
+        data: [
+          String(message),
+          modelSelection || "Auto",
+          false,
+          conversationId || "personal-chat-v5-default",
+        ],
+      }),
+    },
+    GRADIO_START_TIMEOUT_MS
+  );
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(
+      `Gradio start failed (${response.status}): ${text.slice(0, 300)}`
+    );
+  }
+
+  const data = await response.json().catch(() => null);
+
+  if (!data?.event_id) {
+    throw new Error("Gradio did not return an event_id.");
+  }
+
+  return String(data.event_id);
+}
+
+function extractGradioText(value) {
+  if (value == null) return null;
+
+  if (typeof value === "string") return value;
+
+  if (Array.isArray(value)) {
+    // Prefer the last useful string because Gradio may return multiple outputs.
+    for (let i = value.length - 1; i >= 0; i--) {
+      if (typeof value[i] === "string" && value[i].trim()) {
+        return value[i];
+      }
+    }
+    return null;
+  }
+
+  if (typeof value === "object") {
+    for (const key of ["output", "text", "response", "content", "message"]) {
+      if (typeof value[key] === "string") return value[key];
+    }
+  }
+
+  return null;
+}
+
+function parseSseDataLine(line) {
+  if (!line.startsWith("data:")) return null;
+
+  const payload = line.slice(5).trim();
+  if (!payload || payload === "[DONE]") return null;
+
+  try {
+    return JSON.parse(payload);
+  } catch {
+    return null;
+  }
+}
+
+function modelLabel(selection) {
+  const v = String(selection || "auto").toLowerCase();
+  if (v === "7b") return "Qwen 2.5 7B";
+  if (v === "14b") return "Qwen 2.5 14B";
+  return "Auto";
+}
+
+async function collectGradioReply(base, message, cfg, conversationId, model) {
+  const eventId = await startGradioCall(
+    base,
+    message,
+    cfg,
+    conversationId,
+    modelLabel(model)
+  );
+
+  const response = await fetchWithTimeout(
+    `${String(base).replace(/\/+$/, "")}/gradio_api/call/frontend_chat/${encodeURIComponent(eventId)}`,
+    { headers: gradioHeaders(cfg, "text/event-stream") },
+    GRADIO_STREAM_TIMEOUT_MS
+  );
+
+  if (!response.ok || !response.body) {
+    throw new Error(`Gradio stream failed (${response.status}).`);
+  }
+
+  const text = await response.text();
+  let reply = "";
+  let detectedModel = null;
+
+  for (const line of text.split(/\r?\n/)) {
+    const value = parseSseDataLine(line);
+    if (value == null) continue;
+
+    if (value?.error) {
+      throw new Error(
+        String(value.error.message || value.error)
+      );
+    }
+
+    const candidate = extractGradioText(value);
+    if (candidate != null) {
+      reply = candidate;
+      const match = candidate.match(/Qwen\s+2\.5\s+(7B|14B)/i);
+      if (match) detectedModel = `Qwen 2.5 ${match[1].toUpperCase()}`;
+    }
+  }
+
+  return {
+    reply,
+    model: detectedModel || modelLabel(model),
+  };
+}
+
+/*
+ * Native RIVA streaming API.
+ * Response format:
+ * data: {"type":"status",...}
+ * data: {"type":"delta","text":"..."}
+ * data: {"type":"done"}
+ */
+async function streamRivaChat(base, message, cfg, conversationId, model) {
+  const clean = String(base || "").replace(/\/+$/, "");
+  if (!clean) return json({ error: "RIVA is offline." }, 503);
+
+  let eventId;
+
+  try {
+    eventId = await startGradioCall(
+      clean,
+      message,
+      cfg,
+      conversationId,
+      modelLabel(model)
+    );
+  } catch (err) {
+    return json({
+      error: String(err.message || err),
+      type: "upstream_error",
+    }, 502);
+  }
+
+  let upstream;
+
+  try {
+    upstream = await fetchWithTimeout(
+      `${clean}/gradio_api/call/frontend_chat/${encodeURIComponent(eventId)}`,
+      { headers: gradioHeaders(cfg, "text/event-stream") },
+      GRADIO_STREAM_TIMEOUT_MS
+    );
+  } catch (err) {
+    return json({
+      error: `Gradio stream unavailable: ${String(err.message || err)}`,
+      type: "upstream_error",
+    }, 502);
+  }
+
+  if (!upstream.ok || !upstream.body) {
+    return json({
+      error: `Gradio stream failed (${upstream.status}).`,
+      type: "upstream_error",
+    }, 502);
+  }
+
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const reader = upstream.body.getReader();
+
+  let buffer = "";
+
+  const send = (controller, value) => {
+    controller.enqueue(
+      encoder.encode(`data: ${JSON.stringify(value)}\n\n`)
+    );
+  };
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      try {
+        send(controller, {
+          type: "status",
+          status: "connected",
+          model: modelLabel(model),
+        });
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+
+          const lines = buffer.split(/\r?\n/);
+          buffer = lines.pop() || "";
+
+          for (const line of lines) {
+            const value = parseSseDataLine(line);
+            if (value == null) continue;
+
+            if (value?.error) {
+              send(controller, {
+                type: "error",
+                message: String(value.error.message || value.error),
+              });
+              continue;
+            }
+
+            const candidate = extractGradioText(value);
+            if (candidate == null) continue;
+
+            send(controller, {
+              type: "delta",
+              text: String(candidate),
+            });
+
+            const match = String(candidate).match(
+              /Qwen\s+2\.5\s+(7B|14B)/i
+            );
+
+            if (match) {
+              send(controller, {
+                type: "model",
+                model: `Qwen 2.5 ${match[1].toUpperCase()}`,
+              });
+            }
+          }
+        }
+
+        send(controller, { type: "done" });
+        controller.close();
+      } catch (err) {
+        try {
+          send(controller, {
+            type: "error",
+            message: String(err.message || err),
+          });
+          send(controller, { type: "done" });
+        } catch {}
+        try {
+          controller.close();
+        } catch {}
+      } finally {
+        try {
+          reader.releaseLock();
+        } catch {}
+      }
+    },
+
+    cancel() {
+      try {
+        reader.cancel();
+      } catch {}
+    },
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      "connection": "keep-alive",
+      "x-accel-buffering": "no",
+    },
+  });
+}
+
+function openAIModelList(runtime) {
+  const now = Math.floor(Date.now() / 1000);
+  const models = [
+    ["riva-auto", "Auto"],
+    ["riva-7b", "Qwen 2.5 7B"],
+    ["riva-14b", "Qwen 2.5 14B"],
+  ];
+
+  return {
+    object: "list",
+    data: models.map(([id, name]) => ({
+      id,
+      object: "model",
+      created: now,
+      owned_by: "riva",
+      permission: [],
+      root: id,
+      parent: null,
+      name,
+      available: Boolean(runtime?.base),
+    })),
+  };
+}
+
+function normalizeModelId(id) {
+  const value = String(id || "riva-auto").toLowerCase();
+
+  if (value === "riva-7b" || value === "7b" || value.includes("7b")) {
+    return "7b";
+  }
+
+  if (value === "riva-14b" || value === "14b" || value.includes("14b")) {
+    return "14b";
+  }
+
+  return "auto";
+}
+
+function extractMessagesText(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return "";
+
+  // The Gradio endpoint accepts one message. Preserve system/developer
+  // instructions as context before the latest user message.
+  const context = [];
+  let latestUser = "";
+
+  for (const item of messages) {
+    if (!item || typeof item !== "object") continue;
+
+    const role = String(item.role || "");
+    const content = messageContentToText(item.content);
+
+    if (!content) continue;
+
+    if (role === "system" || role === "developer") {
+      context.push(`[${role}]\n${content}`);
+    } else if (role === "user") {
+      latestUser = content;
+    }
+  }
+
+  if (!latestUser) {
+    const last = messages[messages.length - 1];
+    latestUser = messageContentToText(last?.content);
+  }
+
+  return context.length
+    ? `${context.join("\n\n")}\n\n[user]\n${latestUser}`
+    : latestUser;
+}
+
+function messageContentToText(content) {
+  if (typeof content === "string") return content.trim();
+
+  if (Array.isArray(content)) {
+    return content
+      .map(part => {
+        if (typeof part === "string") return part;
+        if (part?.type === "text") return String(part.text || "");
+        return "";
+      })
+      .join("")
+      .trim();
+  }
+
+  if (content && typeof content === "object") {
+    return String(content.text || content.content || "").trim();
+  }
+
+  return "";
+}
+
+async function handleOpenAI(request, url, cfg) {
+  const authError = requireApiKey(request, cfg);
+  if (authError) return withCors(authError, cfg);
+
+  if (url.pathname === "/v1/models") {
+    if (request.method !== "GET") {
+      return withCors(json({ error: "method not allowed" }, 405), cfg);
+    }
+
+    const runtime = await getRuntime(cfg);
+    return withCors(json(openAIModelList(runtime)), cfg);
+  }
+
+  if (url.pathname !== "/v1/chat/completions") {
+    return withCors(json({ error: "not found" }, 404), cfg);
+  }
+
+  if (request.method !== "POST") {
+    return withCors(json({ error: "method not allowed" }, 405), cfg);
+  }
+
+  const body = await readJson(request);
+
+  if (!Array.isArray(body.messages) || body.messages.length === 0) {
+    return withCors(json({
+      error: {
+        message: "messages must be a non-empty array.",
+        type: "invalid_request_error",
+      },
+    }, 400), cfg);
+  }
+
+  const message = extractMessagesText(body.messages);
+  if (!message) {
+    return withCors(json({
+      error: {
+        message: "No text message was provided.",
+        type: "invalid_request_error",
+      },
+    }, 400), cfg);
+  }
+
+  const runtime = await getRuntime(cfg);
+  if (!runtime.base) {
+    return withCors(json({
+      error: {
+        message: "RIVA is offline. No Gradio URL is available.",
+        type: "server_error",
+      },
+    }, 503), cfg);
+  }
+
+  const model = normalizeModelId(body.model);
+
+  // OpenAI streaming mode.
+  if (body.stream === true) {
+    const native = await streamRivaChat(
+      runtime.base,
+      message,
+      cfg,
+      String(body.conversation_id || crypto.randomUUID()),
+      model
+    );
+
+    if (!native.ok || !native.body) {
+      return withCors(native, cfg);
+    }
+
+    const decoder = new TextDecoder();
+    const encoder = new TextEncoder();
+    const reader = native.body.getReader();
+    let buffer = "";
+    const chatId = `chatcmpl-${crypto.randomUUID()}`;
+    const created = Math.floor(Date.now() / 1000);
+    const openAIModel = body.model || `riva-${model}`;
+
+    const stream = new ReadableStream({
+      async start(controller) {
+        const send = obj => {
+          controller.enqueue(
+            encoder.encode(`data: ${JSON.stringify(obj)}\n\n`)
+          );
+        };
+
+        try {
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+
+            const lines = buffer.split(/\r?\n/);
+            buffer = lines.pop() || "";
+
+            for (const line of lines) {
+              if (!line.startsWith("data:")) continue;
+
+              const raw = line.slice(5).trim();
+              if (!raw) continue;
+
+              let event;
+              try {
+                event = JSON.parse(raw);
+              } catch {
+                continue;
+              }
+
+              if (event.type === "delta" && event.text != null) {
+                send({
+                  id: chatId,
+                  object: "chat.completion.chunk",
+                  created,
+                  model: openAIModel,
+                  choices: [{
+                    index: 0,
+                    delta: { content: String(event.text) },
+                    finish_reason: null,
+                  }],
+                });
+              } else if (event.type === "error") {
+                send({
+                  id: chatId,
+                  object: "chat.completion.chunk",
+                  created,
+                  model: openAIModel,
+                  choices: [{
+                    index: 0,
+                    delta: {},
+                    finish_reason: "stop",
+                  }],
+                  error: {
+                    message: String(event.message || "Upstream error"),
+                    type: "server_error",
+                  },
+                });
+              }
+            }
+          }
+
+          send({
+            id: chatId,
+            object: "chat.completion.chunk",
+            created,
+            model: openAIModel,
+            choices: [{
+              index: 0,
+              delta: {},
+              finish_reason: "stop",
+            }],
+          });
+
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          controller.close();
+        } catch (err) {
+          try {
+            send({
+              id: chatId,
+              object: "chat.completion.chunk",
+              created,
+              model: openAIModel,
+              choices: [{
+                index: 0,
+                delta: {},
+                finish_reason: "stop",
+              }],
+              error: {
+                message: String(err.message || err),
+                type: "server_error",
+              },
+            });
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          } catch {}
+          try {
+            controller.close();
+          } catch {}
+        } finally {
+          try {
+            reader.releaseLock();
+          } catch {}
+        }
+      },
+      cancel() {
+        try {
+          reader.cancel();
+        } catch {}
+      },
+    });
+
+    return withCors(new Response(stream, {
+      status: 200,
+      headers: {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache, no-transform",
+        "connection": "keep-alive",
+        "x-accel-buffering": "no",
+      },
+    }), cfg);
+  }
+
+  try {
+    const result = await collectGradioReply(
+      runtime.base,
+      message,
+      cfg,
+      String(body.conversation_id || crypto.randomUUID()),
+      model
+    );
+
+    const promptTokens = Math.ceil(message.length / 4);
+    const completionTokens = Math.ceil(result.reply.length / 4);
+
+    return withCors(json({
+      id: `chatcmpl-${crypto.randomUUID()}`,
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: body.model || `riva-${model}`,
+      choices: [{
+        index: 0,
+        message: {
+          role: "assistant",
+          content: result.reply,
+        },
+        finish_reason: "stop",
+      }],
+      usage: {
+        prompt_tokens: promptTokens,
+        completion_tokens: completionTokens,
+        total_tokens: promptTokens + completionTokens,
+      },
+    }), cfg);
+  } catch (err) {
+    console.error("OpenAI bridge error:", err);
+    return withCors(json({
+      error: {
+        message: String(err.message || err),
+        type: "upstream_error",
+      },
+    }, 502), cfg);
+  }
+}
+
+async function handleApi(request, url, cfg) {
+  const authError = requireApiKey(request, cfg);
+  if (authError) return withCors(authError, cfg);
+
+  const method = request.method;
+  const path = url.pathname;
+
+  if (path === "/api/state" && method === "GET") {
+    const runtime = await getRuntime(cfg);
+    const ping = await pingGradio(runtime.base, cfg);
+
+    return withCors(json({
+      ok: true,
+      state: {
+        current_url: runtime.base || null,
+        desired_state: runtime.desiredState,
+        status: runtime.status,
+      },
+      ping,
+    }), cfg);
+  }
+
+  if (path === "/api/power" && method === "POST") {
+    const body = await readJson(request);
+    const desired =
+      body.desired_state === "offline" ? "offline" : "online";
+
+    const rows = await supabase(
+      cfg,
+      `app_state?id=eq.${safeId(cfg.stateId)}`,
+      {
+        method: "PATCH",
+        body: {
+          desired_state: desired,
+          status: desired === "online" ? "starting" : "stopping",
+        },
+      }
+    );
+
+    return withCors(json({
+      ok: true,
+      state: rows?.[0] || null,
+    }), cfg);
+  }
+
+  if (path === "/api/conversations" && method === "GET") {
+    const rows = await supabase(
+      cfg,
+      "chat_messages?select=conversation_id,role,content,created_at&order=created_at.asc&limit=1000"
+    ) || [];
+
+    const seen = new Map();
+
+    for (const row of rows) {
+      if (!row.conversation_id || row.conversation_id === "riva-super") {
+        continue;
+      }
+
+      const id = String(row.conversation_id);
+      const existing = seen.get(id);
+
+      if (!existing) {
+        seen.set(id, {
+          id,
+          title: row.role === "user"
+            ? String(row.content || "New chat").slice(0, 120)
+            : "Chat",
+          created_at: row.created_at,
+        });
+      } else if (
+        existing.title === "Chat" &&
+        row.role === "user"
+      ) {
+        existing.title = String(
+          row.content || "New chat"
+        ).slice(0, 120);
+      }
+    }
+
+    return withCors(json(
+      [...seen.values()].sort(
+        (a, b) =>
+          new Date(b.created_at) - new Date(a.created_at)
+      )
+    ), cfg);
+  }
+
+  if (path === "/api/conversations" && method === "POST") {
+    const body = await readJson(request);
+
+    return withCors(json({
+      id: crypto.randomUUID(),
+      title: String(body.title || "New chat").slice(0, 120),
+      created_at: new Date().toISOString(),
+    }, 201), cfg);
+  }
+
+  if (
+    path.startsWith("/api/conversations/") &&
+    path.endsWith("/messages") &&
+    method === "GET"
+  ) {
+    const id = path.split("/")[3];
+
+    if (!id) {
+      return withCors(json({ error: "id required" }, 400), cfg);
+    }
+
+    const rows = await supabase(
+      cfg,
+      `chat_messages?select=id,conversation_id,role,content,created_at&conversation_id=eq.${safeId(id)}&order=created_at.asc&limit=200`
+    ) || [];
+
+    return withCors(json(
+      rows.map(row => ({
+        ...row,
+        sender: row.role,
+      }))
+    ), cfg);
+  }
+
+  if (
+    path.startsWith("/api/conversations/") &&
+    method === "DELETE"
+  ) {
+    const id = path.split("/")[3];
+
+    if (!id) {
+      return withCors(json({ error: "id required" }, 400), cfg);
+    }
+
+    await supabase(
+      cfg,
+      `chat_messages?conversation_id=eq.${safeId(id)}`,
+      { method: "DELETE" }
+    );
+
+    return withCors(json({ ok: true }), cfg);
+  }
+
+  if (path === "/api/model" && method === "POST") {
+    const body = await readJson(request);
+
+    if (!body.conversation_id) {
+      return withCors(json({
+        error: "conversation_id required",
+      }, 400), cfg);
+    }
+
+    const selection = normalizeModelId(body.model);
+
+    const runtime = await getRuntime(cfg);
+    if (!runtime.base) {
+      return withCors(json({
+        error: "RIVA is offline. No Gradio URL is available.",
+      }, 503), cfg);
+    }
+
+    try {
+      const result = await collectGradioReply(
+        runtime.base,
+        `/model ${selection}`,
+        cfg,
+        String(body.conversation_id),
+        "auto"
+      );
+
+      return withCors(json({
+        ok: true,
+        model: selection,
+        reply: result.reply || "",
+      }), cfg);
+    } catch (err) {
+      return withCors(json({
+        error: String(err.message || err),
+      }, 502), cfg);
+    }
+  }
+
+  if (path === "/api/chat" && method === "POST") {
+    const body = await readJson(request);
+
+    if (!body.conversation_id || !body.message) {
+      return withCors(json({
+        error: "conversation_id and message are required",
+      }, 400), cfg);
+    }
+
+    const runtime = await getRuntime(cfg);
+
+    return withCors(
+      await streamRivaChat(
+        runtime.base,
+        String(body.message),
+        cfg,
+        String(body.conversation_id),
+        normalizeModelId(body.model)
+      ),
+      cfg
+    );
+  }
+
+  if (path === "/api/stats" && method === "GET") {
+    const count = async table => {
+      try {
+        const response = await fetchWithTimeout(
+          `${cfg.supabaseUrl}/rest/v1/${table}?select=id&limit=1`,
+          {
+            headers: {
+              apikey: cfg.supabaseKey,
+              Authorization: `Bearer ${cfg.supabaseKey}`,
+              Prefer: "count=exact",
+              "Range-Unit": "items",
+              Range: "0-0",
+            },
+          },
+          15_000
+        );
+
+        if (!response.ok) return 0;
+
+        return Number(
+          String(response.headers.get("content-range") || "")
+            .split("/")[1]
+        ) || 0;
+      } catch {
+        return 0;
+      }
+    };
+
+    const [memories, facts, chunks, msgs] = await Promise.all([
+      count("memories"),
+      count("facts"),
+      count("document_chunks"),
+      count("chat_messages"),
+    ]);
+
+    return withCors(json({
+      memories,
+      facts,
+      chunks,
+      msgs,
+    }), cfg);
+  }
+
+  return withCors(json({ error: "not found" }, 404), cfg);
+}
+
+
+const UI = String.raw`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>RIVA</title>
+<style>
+*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:transparent;font-family:Inter,system-ui,-apple-system,Segoe UI,Arial,sans-serif;color:#eef3ff}
+#riva-toggle{display:none}
+#riva-pet{position:fixed;right:24px;bottom:24px;width:78px;height:78px;border:0;border-radius:50%;z-index:2147483647;cursor:pointer;background:linear-gradient(145deg,#7057ff,#18bfff);box-shadow:0 12px 38px #0008,0 0 38px #635bff66;display:flex;align-items:center;justify-content:center;transition:.2s}
+#riva-pet:hover{transform:scale(1.07);box-shadow:0 16px 45px #000a,0 0 50px #635bff99}
+.pet-ring{position:absolute;inset:-8px;border:2px solid #6ee7ff66;border-radius:50%;animation:pulse 2s infinite}
+.pet-face{position:relative;width:52px;height:42px;border:2px solid #aab8ff;border-radius:17px;background:#11182d;box-shadow:inset 0 0 16px #0009}
+.pet-eye{position:absolute;top:11px;width:8px;height:10px;border-radius:50%;background:#61e7ff;box-shadow:0 0 12px #61e7ff}.pet-eye.left{left:10px}.pet-eye.right{right:10px}
+.pet-mouth{position:absolute;left:17px;top:28px;width:14px;height:5px;border-bottom:2px solid #fff;border-radius:50%}
+.pet-status{position:absolute;right:-1px;top:-1px;width:18px;height:18px;border:3px solid #11182d;border-radius:50%;background:#55ef9b}
+#riva-popup{position:fixed;right:24px;bottom:116px;width:410px;height:600px;max-width:calc(100vw - 28px);max-height:calc(100vh - 135px);z-index:2147483646;display:flex;flex-direction:column;overflow:hidden;opacity:0;visibility:hidden;pointer-events:none;transform:translateY(18px) scale(.96);transform-origin:bottom right;background:#080d1b;border:1px solid #ffffff18;border-radius:22px;box-shadow:0 28px 85px #000c,0 0 55px #635bff22;transition:opacity .18s ease,transform .18s ease,visibility .18s ease}
+#riva-toggle:checked~#riva-popup{opacity:1;visibility:visible;pointer-events:auto;transform:translateY(0) scale(1)}
+.riva-header{height:68px;flex:0 0 68px;display:flex;align-items:center;gap:10px;padding:10px 12px;background:#10162a;border-bottom:1px solid #ffffff12}.riva-avatar{width:43px;height:43px;border-radius:14px;display:grid;place-items:center;background:linear-gradient(145deg,#7057ff,#18bfff)}.mini-face{width:27px;height:21px;border-radius:8px;background:#11182d;position:relative}.mini-face:after{content:"••";position:absolute;left:7px;top:2px;color:#61e7ff;font-size:10px;letter-spacing:4px}.riva-title{flex:1;min-width:0}.riva-title strong{display:block;font-size:15px}.riva-title small{display:block;color:#7f8ba7;font-size:10px;margin-top:3px}.riva-close{width:36px;height:36px;border:0;border-radius:10px;background:#ffffff0a;color:#dce3f4;font-size:22px;display:grid;place-items:center;cursor:pointer}
+#riva-messages{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;padding:14px;background:#080d1b;scrollbar-width:thin}#riva-messages::-webkit-scrollbar{width:6px}#riva-messages::-webkit-scrollbar-thumb{background:#ffffff20;border-radius:10px}
+.riva-message{display:flex;width:100%;margin:0 0 10px}.riva-message.user{justify-content:flex-end}.riva-bubble{max-width:86%;padding:10px 12px;border-radius:15px;font-size:13px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}.riva-message.assistant .riva-bubble{background:#151c30;border:1px solid #ffffff0d}.riva-message.user .riva-bubble{background:linear-gradient(135deg,#6753ee,#258df5)}
+.riva-actions{display:flex;gap:7px;overflow-x:auto;flex:0 0 auto;padding:9px 11px;background:#0b1020;border-top:1px solid #ffffff0b}.riva-action{flex:0 0 auto;border:1px solid #ffffff12;background:#ffffff07;color:#aeb9d2;border-radius:10px;padding:7px 10px;font-size:10px;cursor:pointer}
+.riva-composer{display:flex;align-items:flex-end;gap:7px;padding:10px 11px 7px;background:#0b1020}.riva-composer textarea{flex:1;min-width:0;min-height:43px;max-height:110px;resize:none;border:1px solid #ffffff12;border-radius:14px;background:#060a15;color:#fff;outline:0;padding:12px;font:inherit;font-size:13px}.riva-composer textarea:focus{border-color:#718cff88}.riva-mic,.riva-send{width:43px;height:43px;flex:0 0 43px;border-radius:13px;cursor:pointer}.riva-mic{border:1px solid #ffffff12;background:#ffffff08;color:#dce5ff;font-size:16px}.riva-mic.active{background:#ef4444;color:#fff}.riva-send{border:0;background:linear-gradient(135deg,#735aff,#23bfff);color:#fff;font-size:17px;font-weight:700}.riva-send:disabled{opacity:.4}.riva-footer{height:24px;flex:0 0 24px;display:grid;place-items:center;color:#56627a;background:#0b1020;font-size:9px}
+@keyframes pulse{0%{transform:scale(.9);opacity:.7}70%,100%{transform:scale(1.25);opacity:0}}
+@media(max-width:600px){#riva-pet{width:64px;height:64px;right:14px;bottom:14px}.pet-face{transform:scale(.84)}#riva-popup{left:7px;right:7px;bottom:84px;width:auto;max-width:none;height:calc(100vh - 96px);max-height:none;border-radius:18px;transform-origin:bottom center}}
+</style>
+</head>
+<body>
+<input id="riva-toggle" type="checkbox">
+<label id="riva-pet" for="riva-toggle" title="Open RIVA">
+  <span class="pet-ring"></span><span class="pet-face"><span class="pet-eye left"></span><span class="pet-eye right"></span><span class="pet-mouth"></span></span><span class="pet-status"></span>
+</label>
+<section id="riva-popup">
+  <header class="riva-header">
+    <div class="riva-avatar"><div class="mini-face"></div></div>
+    <div class="riva-title"><strong>RIVA</strong><small id="riva-status">Online · Quick Chat</small></div>
+    <label class="riva-close" for="riva-toggle" title="Close">×</label>
+  </header>
+  <main id="riva-messages">
+    <div class="riva-message assistant"><div class="riva-bubble">Hi 👋 I'm RIVA. Click the pet whenever you want a quick conversation.</div></div>
+  </main>
+  <div class="riva-actions">
+    <button class="riva-action" data-q="What can you do?">What can you do?</button>
+    <button class="riva-action" data-q="Explain this simply: ">Explain simply</button>
+    <button class="riva-action" data-q="Help me plan: ">Help me plan</button>
+  </div>
+  <div class="riva-composer">
+    <button class="riva-mic" id="riva-mic" title="Voice input">🎙</button>
+    <textarea id="riva-input" rows="1" placeholder="Ask RIVA..."></textarea>
+    <button class="riva-send" id="riva-send">➤</button>
+  </div>
+  <footer class="riva-footer">RIVA Quick Assistant</footer>
+</section>
+<script>
+(function(){
+  const input=document.getElementById('riva-input');
+  const send=document.getElementById('riva-send');
+  const messages=document.getElementById('riva-messages');
+  const status=document.getElementById('riva-status');
+  const mic=document.getElementById('riva-mic');
+  let busy=false;
+  let conversationId=localStorage.getItem('riva_conversation')||crypto.randomUUID();
+  localStorage.setItem('riva_conversation',conversationId);
+
+  function addMessage(role,text){
+    const row=document.createElement('div');row.className='riva-message '+role;
+    const bubble=document.createElement('div');bubble.className='riva-bubble';bubble.textContent=text;
+    row.appendChild(bubble);messages.appendChild(row);messages.scrollTop=messages.scrollHeight;return bubble;
+  }
+
+  async function sendMessage(){
+    if(busy)return;const text=input.value.trim();if(!text)return;
+    busy=true;send.disabled=true;input.value='';input.style.height='43px';
+    addMessage('user',text);const answer=addMessage('assistant','');status.textContent='Thinking...';
+    try{
+      const headers={'Content-Type':'application/json'};
+      const key=localStorage.getItem('riva_api_key');if(key)headers.Authorization='Bearer '+key;
+      const response=await fetch('/v1/chat/completions',{method:'POST',headers,body:JSON.stringify({model:'riva-auto',messages:[{role:'user',content:text}],stream:true,conversation_id:conversationId})});
+      if(!response.ok)throw new Error((await response.text()).slice(0,500)||('HTTP '+response.status));
+      if(!response.body)throw new Error('Streaming response is unavailable.');
+      const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='',full='';
+      while(true){
+        const r=await reader.read();if(r.done)break;buffer+=decoder.decode(r.value,{stream:true});
+        const lines=buffer.split(/\r?\n/);buffer=lines.pop()||'';
+        for(const line of lines){
+          if(!line.startsWith('data:'))continue;const raw=line.slice(5).trim();if(raw==='[DONE]')continue;
+          try{const data=JSON.parse(raw);const delta=data?.choices?.[0]?.delta?.content;if(delta){full+=delta;answer.textContent=full;messages.scrollTop=messages.scrollHeight}if(data?.error)throw new Error(data.error.message||'Server error');}catch(e){if(e?.message&&e.message!=='Unexpected end of JSON input'){} }
+        }
+      }
+      if(!full)answer.textContent='No response received.';status.textContent='Online · Ready';
+      if(localStorage.getItem('riva_speak')==='1'&&'speechSynthesis' in window){speechSynthesis.cancel();speechSynthesis.speak(new SpeechSynthesisUtterance(full));}
+    }catch(e){answer.textContent='⚠ '+(e.message||'Connection error');status.textContent='Connection error';}
+    finally{busy=false;send.disabled=false;input.focus();}
+  }
+
+  send.onclick=sendMessage;
+  input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMessage()}});
+  input.addEventListener('input',()=>{input.style.height='43px';input.style.height=Math.min(input.scrollHeight,110)+'px'});
+  document.querySelectorAll('.riva-action').forEach(b=>b.onclick=()=>{input.value=b.dataset.q;input.focus()});
+
+  const SpeechRecognition=window.SpeechRecognition||window.webkitSpeechRecognition;
+  if(SpeechRecognition){
+    const recognition=new SpeechRecognition();recognition.lang=navigator.language||'en-US';recognition.interimResults=true;recognition.continuous=false;
+    recognition.onstart=()=>{mic.classList.add('active');status.textContent='Listening...'};
+    recognition.onend=()=>{mic.classList.remove('active');status.textContent='Online · Ready'};
+    recognition.onerror=()=>{mic.classList.remove('active');status.textContent='Voice error'};
+    recognition.onresult=e=>{let t='';for(let i=e.resultIndex;i<e.results.length;i++)t+=e.results[i][0].transcript;input.value=t;input.dispatchEvent(new Event('input'))};
+    mic.onclick=()=>{try{recognition.start()}catch(e){}};
+  }else mic.onclick=()=>{status.textContent='Voice input is not supported here'};
+})();
+</script>
+</body>
+</html>`;
