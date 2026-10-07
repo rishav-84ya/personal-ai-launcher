@@ -1,1325 +1,721 @@
 /**
- * RIVA — Rishav Intelligent Virtual Assistant
- * Cloudflare Worker — API + floating Pet + Quick Chat edition
+ * RIVA — Rishav Intelligent Virtual Assistant | Cloudflare Worker (single file) v3.0
+ * Supabase (app_state, chat_messages) <-> Kaggle Gradio model
  *
- * Required Worker secrets/vars:
- *   SUPABASE_URL
- *   SUPABASE_SECRET_KEY
+ * Variables: SUPABASE_URL, SUPABASE_SECRET_KEY, STATE_ID (main_ai),
+ *            GRADIO_USERNAME / GRADIO_PASSWORD (optional)
  *
- * Optional:
- *   STATE_ID              default: main_ai
- *   RIVA_API_KEY          Bearer key for public API protection
- *   RIVA_CORS_ORIGIN      e.g. https://your-frontend.pages.dev
- *                         or "*" for a public API
- *   GRADIO_USERNAME
- *   GRADIO_PASSWORD
- *
- * Supabase tables used:
- *   app_state(id, current_url, desired_state, status)
- *   gradio_urls(id, url)                  fallback only
- *   chat_messages(id, conversation_id, role, content, created_at)
- *
- * No HTML, CSS, browser JavaScript, DOM APIs, Node.js APIs, or UI are used.
+ * WHY THE OLD UI WAS DEAD: the page lived inside a JS template literal, so
+ * '\n' inside the client <script> turned into a real line break and broke the
+ * script (syntax error = nothing clickable). This version serves the HTML via
+ * String.raw so the client code reaches the browser unchanged.
  */
-
-const DEFAULT_STATE_ID = "main_ai";
-const MAX_BODY_BYTES = 512 * 1024;
-const GRADIO_START_TIMEOUT_MS = 20_000;
-const GRADIO_STREAM_TIMEOUT_MS = 120_000;
-const GRADIO_PING_TIMEOUT_MS = 5_000;
 
 export default {
   async fetch(request, env) {
-    const url = new URL(request.url);
-    const cfg = {
-      stateId: env.STATE_ID || DEFAULT_STATE_ID,
-      supabaseUrl: String(env.SUPABASE_URL || "").replace(/\/+$/, ""),
-      supabaseKey: env.SUPABASE_SECRET_KEY || "",
-      gradioUsername: env.GRADIO_USERNAME || "",
-      gradioPassword: env.GRADIO_PASSWORD || "",
-      apiKey: env.RIVA_API_KEY || "",
-      corsOrigin: env.RIVA_CORS_ORIGIN || "*",
+    const CFG = {
+      stateId: env.STATE_ID || 'main_ai',
+      supabaseUrl: env.SUPABASE_URL,
+      supabaseKey: env.SUPABASE_SECRET_KEY || '',
+      gradioUsername: env.GRADIO_USERNAME || '',
+      gradioPassword: env.GRADIO_PASSWORD || '',
     };
-
-    try {
-      if (request.method === "OPTIONS") {
-        return withCors(new Response(null, { status: 204 }), cfg);
-      }
-
-      // Always keep a lightweight health endpoint for Cloudflare health checks.
-      if (url.pathname === "/health") {
-        return withCors(json({
-          ok: true,
-          service: "riva-worker",
-          version: "5.1-pet-quickchat",
-          ui: false,
-          timestamp: new Date().toISOString(),
-        }), cfg);
-      }
-
-      // OpenAI-compatible API.
-      if (url.pathname === "/v1/models" || url.pathname === "/v1/chat/completions") {
-        return await handleOpenAI(request, url, cfg);
-      }
-
-      // Native RIVA API for simple clients.
-      if (url.pathname.startsWith("/api/")) {
-        return await handleApi(request, url, cfg);
-      }
-
-      // Lightweight RIVA pet + secondary quick-chat window.
-      if (url.pathname === "/" || url.pathname === "/index.html" || url.pathname === "/quick") {
-        return new Response(UI, {
-          headers: {
-            "content-type": "text/html; charset=utf-8",
-            "cache-control": "no-store",
-            "x-content-type-options": "nosniff",
-          },
-        });
-      }
-
-      return withCors(json({
-        ok: true,
-        service: "RIVA",
-        version: "5.1-pet-quickchat",
-        ui: "/",
-        endpoints: {
-          health: "/health",
-          models: "/v1/models",
-          chat: "/v1/chat/completions",
-          state: "/api/state",
-          nativeChat: "/api/chat",
-          conversations: "/api/conversations",
-        },
-      }), cfg);
-    } catch (err) {
-      console.error("Unhandled RIVA Worker error:", err);
-      return withCors(json({
-        error: {
-          message: "Internal server error.",
-          type: "server_error",
-        },
-      }, 500), cfg);
+    const url = new URL(request.url);
+    if (url.pathname === '/health') return json({ status: 'ok' });
+    if (url.pathname === '/v1/models' || url.pathname === '/v1/chat/completions' || request.method === 'OPTIONS') {
+      try { return await handleRivaApi(request, url, CFG); }
+      catch (err) { return withCors(json({ error: String(err.message || err) }, 500)); }
     }
+    if (url.pathname.startsWith('/api/')) {
+      try { return await handleApi(request, url, CFG); }
+      catch (err) { return json({ error: String(err.message || err) }, 500); }
+    }
+    if (request.method !== 'GET' || (url.pathname !== '/' && url.pathname !== '/index.html')) {
+      return new Response('Not found.', { status: 404 });
+    }
+    return new Response(HTML, {
+      headers: {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'no-store',
+        'content-security-policy': "default-src 'self'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'",
+        'x-content-type-options': 'nosniff',
+        'referrer-policy': 'no-referrer',
+      },
+    });
   },
 };
 
-function json(data, status = 200, extraHeaders = {}) {
-  return new Response(JSON.stringify(data), {
-    status,
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json; charset=utf-8' } });
+}
+
+async function sb(CFG, path, { method = 'GET', body, headers = {} } = {}) {
+  if (!CFG.supabaseUrl || !CFG.supabaseKey) throw new Error('Worker secrets SUPABASE_URL and SUPABASE_SECRET_KEY are required.');
+  const r = await fetch(CFG.supabaseUrl + '/rest/v1/' + path, {
+    method,
     headers: {
-      "content-type": "application/json; charset=utf-8",
-      "cache-control": "no-store",
-      ...extraHeaders,
+      apikey: CFG.supabaseKey,
+      Authorization: 'Bearer ' + CFG.supabaseKey,
+      'Content-Type': 'application/json',
+      Prefer: method === 'GET' ? '' : 'return=representation',
+      ...headers,
     },
+    body: body ? JSON.stringify(body) : undefined,
   });
+  if (!r.ok) {
+    const t = await r.text().catch(() => '');
+    throw new Error('Supabase ' + r.status + ': ' + t.slice(0, 300));
+  }
+  const t = await r.text();
+  return t ? JSON.parse(t) : null;
 }
 
-function withCors(response, cfg) {
-  const h = new Headers(response.headers);
-  const origin = cfg.corsOrigin || "*";
-
-  h.set("access-control-allow-origin", origin);
-  h.set("access-control-allow-methods", "GET,POST,DELETE,OPTIONS");
-  h.set(
-    "access-control-allow-headers",
-    "Authorization,Content-Type,Accept,Cache-Control"
-  );
-  h.set("access-control-max-age", "86400");
-  h.set("vary", "Origin");
-  h.set("x-content-type-options", "nosniff");
-  h.set("referrer-policy", "no-referrer");
-
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: h,
-  });
+function gradioHeaders(CFG) {
+  const h = new Headers({ accept: 'application/json' });
+  if (CFG.gradioUsername || CFG.gradioPassword) h.set('authorization', 'Basic ' + btoa(CFG.gradioUsername + ':' + CFG.gradioPassword));
+  return h;
 }
 
-function requireApiKey(request, cfg) {
-  if (!cfg.apiKey) return null;
-
-  const auth = request.headers.get("authorization") || "";
-  if (auth !== `Bearer ${cfg.apiKey}`) {
-    return json({
-      error: {
-        message: "Unauthorized.",
-        type: "authentication_error",
-        code: "invalid_api_key",
-      },
-    }, 401);
-  }
-
-  return null;
-}
-
-async function readJson(request, maxBytes = MAX_BODY_BYTES) {
-  const contentLength = Number(request.headers.get("content-length") || 0);
-  if (contentLength > maxBytes) {
-    throw new Error("Request body too large.");
-  }
-
-  const text = await request.text();
-
-  if (new TextEncoder().encode(text).byteLength > maxBytes) {
-    throw new Error("Request body too large.");
-  }
-
-  if (!text.trim()) return {};
-
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new Error("Invalid JSON.");
-  }
-}
-
-function safeId(value) {
-  return encodeURIComponent(String(value || ""));
-}
-
-async function fetchWithTimeout(url, options = {}, timeoutMs = 30_000) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
-
-  try {
-    return await fetch(url, {
-      ...options,
-      signal: options.signal || controller.signal,
-    });
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function supabase(cfg, path, {
-  method = "GET",
-  body,
-  headers = {},
-} = {}) {
-  if (!cfg.supabaseUrl || !cfg.supabaseKey) {
-    throw new Error(
-      "SUPABASE_URL and SUPABASE_SECRET_KEY are required."
-    );
-  }
-
-  const response = await fetchWithTimeout(
-    `${cfg.supabaseUrl}/rest/v1/${path}`,
-    {
-      method,
-      headers: {
-        apikey: cfg.supabaseKey,
-        Authorization: `Bearer ${cfg.supabaseKey}`,
-        "content-type": "application/json",
-        Prefer: method === "GET" ? "" : "return=representation",
-        ...headers,
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    },
-    20_000
-  );
-
-  if (!response.ok) {
-    const bodyText = await response.text().catch(() => "");
-    throw new Error(
-      `Supabase ${response.status}: ${bodyText.slice(0, 500)}`
-    );
-  }
-
-  const text = await response.text();
-  if (!text) return null;
-
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new Error("Supabase returned invalid JSON.");
-  }
-}
-
-function gradioHeaders(cfg, accept = "application/json") {
-  const headers = new Headers({ accept });
-
-  if (cfg.gradioUsername || cfg.gradioPassword) {
-    headers.set(
-      "authorization",
-      `Basic ${btoa(`${cfg.gradioUsername}:${cfg.gradioPassword}`)}`
-    );
-  }
-
-  return headers;
-}
-
-async function getRuntime(cfg) {
-  let state = {};
-
-  try {
-    const rows = await supabase(
-      cfg,
-      `app_state?select=current_url,desired_state,status&id=eq.${safeId(cfg.stateId)}&limit=1`
-    );
-    state = rows?.[0] || {};
-  } catch (err) {
-    console.error("Could not read app_state:", err);
-  }
-
-  let base = String(state.current_url || "").trim().replace(/\/+$/, "");
-
-  // Fallback for installations that still use gradio_urls.
-  if (!base) {
-    try {
-      const rows = await supabase(
-        cfg,
-        "gradio_urls?select=url&id=eq.1&limit=1"
-      );
-      base = String(rows?.[0]?.url || "").trim().replace(/\/+$/, "");
-    } catch (err) {
-      console.error("Could not read gradio_urls:", err);
-    }
-  }
-
-  return {
-    base,
-    status: state.status || null,
-    desiredState: state.desired_state || null,
-  };
-}
-
-async function pingGradio(base, cfg) {
-  if (!base) {
-    return {
-      live: false,
-      reason: "no-url",
-      url: null,
-      latencyMs: null,
-    };
-  }
-
-  const clean = base.replace(/\/+$/, "");
-  const started = Date.now();
+async function pingGradio(gradioUrl, CFG) {
+  if (!gradioUrl) return { live: false, reason: 'no-url', url: null, latencyMs: null };
+  const base = gradioUrl.replace(/\/$/, '');
+  const t0 = Date.now();
   let lastStatus = null;
-
-  for (const path of ["/gradio_api/info", "/info"]) {
+  for (const path of ['/info', '/gradio_api/info']) {
     try {
-      const response = await fetchWithTimeout(
-        clean + path,
-        { headers: gradioHeaders(cfg) },
-        GRADIO_PING_TIMEOUT_MS
-      );
-
-      lastStatus = response.status;
-
-      if (response.ok) {
-        return {
-          live: true,
-          url: clean,
-          latencyMs: Date.now() - started,
-          endpoint: path,
-        };
-      }
-    } catch {
-      // Try the next Gradio info endpoint.
-    }
+      const r = await fetch(base + path, { headers: gradioHeaders(CFG), signal: AbortSignal.timeout(5000) });
+      lastStatus = r.status;
+      if (r.ok) return { live: true, url: gradioUrl, latencyMs: Date.now() - t0 };
+    } catch (_) {}
   }
-
-  return {
-    live: false,
-    reason: lastStatus ? `http-${lastStatus}` : "unreachable",
-    url: clean,
-    latencyMs: Date.now() - started,
-  };
+  return { live: false, reason: lastStatus ? 'http-' + lastStatus : 'unreachable', url: gradioUrl, latencyMs: Date.now() - t0 };
 }
 
-/*
- * Gradio frontend_chat bridge.
- *
- * Current RIVA/Kaggle Gradio contract:
- * POST /gradio_api/call/frontend_chat
- * { data: [message, modelSelection, false, conversationId] }
- *
- * Then:
- * GET /gradio_api/call/frontend_chat/:event_id
- */
-async function startGradioCall(
-  base,
-  message,
-  cfg,
-  conversationId,
-  modelSelection
-) {
-  const clean = String(base || "").replace(/\/+$/, "");
-  if (!clean) throw new Error("RIVA is offline: no Gradio URL.");
-
-  const response = await fetchWithTimeout(
-    `${clean}/gradio_api/call/frontend_chat`,
-    {
-      method: "POST",
-      headers: new Headers({
-        ...Object.fromEntries(gradioHeaders(cfg)),
-        "content-type": "application/json",
-      }),
-      body: JSON.stringify({
-        data: [
-          String(message),
-          modelSelection || "Auto",
-          false,
-          conversationId || "personal-chat-v5-default",
-        ],
-      }),
-    },
-    GRADIO_START_TIMEOUT_MS
-  );
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(
-      `Gradio start failed (${response.status}): ${text.slice(0, 300)}`
-    );
+function parseGradioSSE(raw) {
+  let out = null;
+  for (const line of String(raw || '').split(/\r?\n/)) {
+    if (!line.startsWith('data:')) continue;
+    const p = line.slice(5).trim();
+    if (!p || p === '[DONE]') continue;
+    try {
+      const v = JSON.parse(p);
+      if (Array.isArray(v)) { const c = v.find(x => typeof x === 'string'); if (c != null) out = c; }
+      else if (typeof v === 'string') out = v;
+    } catch (_) {}
   }
-
-  const data = await response.json().catch(() => null);
-
-  if (!data?.event_id) {
-    throw new Error("Gradio did not return an event_id.");
-  }
-
-  return String(data.event_id);
+  return out == null ? null : String(out);
 }
 
-function extractGradioText(value) {
-  if (value == null) return null;
-
-  if (typeof value === "string") return value;
-
-  if (Array.isArray(value)) {
-    // Prefer the last useful string because Gradio may return multiple outputs.
-    for (let i = value.length - 1; i >= 0; i--) {
-      if (typeof value[i] === "string" && value[i].trim()) {
-        return value[i];
-      }
-    }
-    return null;
-  }
-
-  if (typeof value === "object") {
-    for (const key of ["output", "text", "response", "content", "message"]) {
-      if (typeof value[key] === "string") return value[key];
-    }
-  }
-
-  return null;
+function withCors(response) {
+  const h = new Headers(response.headers);
+  h.set('access-control-allow-origin', '*');
+  h.set('access-control-allow-methods', 'GET,POST,OPTIONS');
+  h.set('access-control-allow-headers', 'Authorization,Content-Type');
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers: h });
 }
 
-function parseSseDataLine(line) {
-  if (!line.startsWith("data:")) return null;
-
-  const payload = line.slice(5).trim();
-  if (!payload || payload === "[DONE]") return null;
-
+async function getCurrentUrl(CFG) {
+  let state = {};
   try {
-    return JSON.parse(payload);
-  } catch {
-    return null;
+    const rows = await sb(CFG, 'app_state?select=current_url,status&id=eq.' + encodeURIComponent(CFG.stateId));
+    state = (rows && rows[0]) || {};
+  } catch (_) {}
+  let base = String(state.current_url || '').replace(/\/$/, '');
+  if (!base) {
+    try {
+      const rows = await sb(CFG, 'gradio_urls?select=url&id=eq.1&limit=1');
+      base = String(rows?.[0]?.url || '').replace(/\/$/, '');
+    } catch (_) {}
   }
+  return { base, status: state.status || null };
 }
 
-function modelLabel(selection) {
-  const v = String(selection || "auto").toLowerCase();
-  if (v === "7b") return "Qwen 2.5 7B";
-  if (v === "14b") return "Qwen 2.5 14B";
-  return "Auto";
-}
-
-async function collectGradioReply(base, message, cfg, conversationId, model) {
-  const eventId = await startGradioCall(
-    base,
-    message,
-    cfg,
-    conversationId,
-    modelLabel(model)
-  );
-
-  const response = await fetchWithTimeout(
-    `${String(base).replace(/\/+$/, "")}/gradio_api/call/frontend_chat/${encodeURIComponent(eventId)}`,
-    { headers: gradioHeaders(cfg, "text/event-stream") },
-    GRADIO_STREAM_TIMEOUT_MS
-  );
-
-  if (!response.ok || !response.body) {
-    throw new Error(`Gradio stream failed (${response.status}).`);
-  }
-
-  const text = await response.text();
-  let reply = "";
-  let detectedModel = null;
-
-  for (const line of text.split(/\r?\n/)) {
-    const value = parseSseDataLine(line);
-    if (value == null) continue;
-
-    if (value?.error) {
-      throw new Error(
-        String(value.error.message || value.error)
-      );
-    }
-
-    const candidate = extractGradioText(value);
-    if (candidate != null) {
-      reply = candidate;
-      const match = candidate.match(/Qwen\s+2\.5\s+(7B|14B)/i);
-      if (match) detectedModel = `Qwen 2.5 ${match[1].toUpperCase()}`;
-    }
-  }
-
-  return {
-    reply,
-    model: detectedModel || modelLabel(model),
-  };
-}
-
-/*
- * Native RIVA streaming API.
- * Response format:
- * data: {"type":"status",...}
- * data: {"type":"delta","text":"..."}
- * data: {"type":"done"}
- */
-async function streamRivaChat(base, message, cfg, conversationId, model) {
-  const clean = String(base || "").replace(/\/+$/, "");
-  if (!clean) return json({ error: "RIVA is offline." }, 503);
-
-  let eventId;
-
+// OpenAI-compatible passthrough
+async function handleRivaApi(request, url, CFG) {
+  if (request.method === 'OPTIONS') return withCors(new Response(null, { status: 204 }));
+  if (!['GET', 'POST'].includes(request.method)) return withCors(json({ error: 'method not allowed' }, 405));
+  const { base, status } = await getCurrentUrl(CFG);
+  if (!base) return withCors(json({ error: { message: 'RIVA offline: app_state.current_url is empty', type: 'server_error' } }, 503));
+  if (url.pathname !== '/v1/models' && url.pathname !== '/v1/chat/completions') return withCors(json({ error: 'not found' }, 404));
+  const headers = new Headers();
+  const ct = request.headers.get('content-type');
+  if (ct) headers.set('content-type', ct);
   try {
-    eventId = await startGradioCall(
-      clean,
-      message,
-      cfg,
-      conversationId,
-      modelLabel(model)
-    );
+    const up = await fetch(base + url.pathname, {
+      method: request.method, headers,
+      body: request.method === 'POST' ? request.body : undefined,
+      signal: AbortSignal.timeout(120000),
+    });
+    const res = new Response(up.body, { status: up.status, statusText: up.statusText, headers: up.headers });
+    res.headers.set('x-riva-upstream', base + url.pathname);
+    if (status) res.headers.set('x-riva-kaggle-status', status);
+    return withCors(res);
   } catch (err) {
-    return json({
-      error: String(err.message || err),
-      type: "upstream_error",
-    }, 502);
+    return withCors(json({ error: { message: 'RIVA upstream unavailable: ' + String(err.message || err), type: 'server_error' } }, 502));
   }
+}
 
-  let upstream;
+async function startGradioCall(base, message, CFG, conversationId) {
+  const headers = gradioHeaders(CFG);
+  headers.set('content-type', 'application/json');
+  const start = await fetch(base + '/gradio_api/call/frontend_chat', {
+    method: 'POST', headers,
+    body: JSON.stringify({ data: [message, 'Auto', false, conversationId || 'personal-chat-v4-default'] }),
+    signal: AbortSignal.timeout(20000),
+  });
+  if (!start.ok) throw new Error('Gradio start failed (' + start.status + ')');
+  const started = await start.json().catch(() => ({}));
+  if (!started.event_id) throw new Error('Gradio did not return an event id.');
+  return started.event_id;
+}
 
+async function runGradioCommand(gradioUrl, message, CFG, conversationId) {
+  const base = (gradioUrl || '').replace(/\/$/, '');
+  if (!base) return { ok: false, error: 'No Gradio URL available.' };
   try {
-    upstream = await fetchWithTimeout(
-      `${clean}/gradio_api/call/frontend_chat/${encodeURIComponent(eventId)}`,
-      { headers: gradioHeaders(cfg, "text/event-stream") },
-      GRADIO_STREAM_TIMEOUT_MS
-    );
-  } catch (err) {
-    return json({
-      error: `Gradio stream unavailable: ${String(err.message || err)}`,
-      type: "upstream_error",
-    }, 502);
-  }
+    const id = await startGradioCall(base, message, CFG, conversationId);
+    const up = await fetch(base + '/gradio_api/call/frontend_chat/' + encodeURIComponent(id), { headers: gradioHeaders(CFG), signal: AbortSignal.timeout(30000) });
+    if (!up.ok) return { ok: false, error: 'Gradio command stream failed (' + up.status + ').' };
+    return { ok: true, reply: parseGradioSSE(await up.text()) || '' };
+  } catch (e) { return { ok: false, error: String(e.message || e) }; }
+}
 
-  if (!upstream.ok || !upstream.body) {
-    return json({
-      error: `Gradio stream failed (${upstream.status}).`,
-      type: "upstream_error",
-    }, 502);
-  }
+async function streamGradioToBrowser(gradioUrl, message, CFG, conversationId, modelSelection) {
+  const base = (gradioUrl || '').replace(/\/$/, '');
+  if (!base) return json({ error: 'RIVA is offline. Start the server from the Server tab.' }, 503);
+  let eventId, upstream;
+  try {
+    eventId = await startGradioCall(base, message, CFG, conversationId);
+    upstream = await fetch(base + '/gradio_api/call/frontend_chat/' + encodeURIComponent(eventId), { headers: gradioHeaders(CFG), signal: AbortSignal.timeout(120000) });
+  } catch (e) { return json({ error: String(e.message || e) }, 502); }
+  if (!upstream.ok || !upstream.body) return json({ error: 'Gradio stream failed (' + upstream.status + ')' }, 502);
 
-  const encoder = new TextEncoder();
-  const decoder = new TextDecoder();
-  const reader = upstream.body.getReader();
-
-  let buffer = "";
-
-  const send = (controller, value) => {
-    controller.enqueue(
-      encoder.encode(`data: ${JSON.stringify(value)}\n\n`)
-    );
-  };
-
+  const enc = new TextEncoder(), dec = new TextDecoder(), reader = upstream.body.getReader();
+  let buffer = '';
+  const send = (c, o) => c.enqueue(enc.encode('data: ' + JSON.stringify(o) + '\n\n'));
   const stream = new ReadableStream({
     async start(controller) {
       try {
-        send(controller, {
-          type: "status",
-          status: "connected",
-          model: modelLabel(model),
-        });
-
+        send(controller, { type: 'status', status: 'connected', model: modelSelection || 'auto' });
         while (true) {
           const { value, done } = await reader.read();
           if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-
+          buffer += dec.decode(value, { stream: true });
           const lines = buffer.split(/\r?\n/);
-          buffer = lines.pop() || "";
-
+          buffer = lines.pop() || '';
           for (const line of lines) {
-            const value = parseSseDataLine(line);
-            if (value == null) continue;
-
-            if (value?.error) {
-              send(controller, {
-                type: "error",
-                message: String(value.error.message || value.error),
-              });
-              continue;
-            }
-
-            const candidate = extractGradioText(value);
-            if (candidate == null) continue;
-
-            send(controller, {
-              type: "delta",
-              text: String(candidate),
-            });
-
-            const match = String(candidate).match(
-              /Qwen\s+2\.5\s+(7B|14B)/i
-            );
-
-            if (match) {
-              send(controller, {
-                type: "model",
-                model: `Qwen 2.5 ${match[1].toUpperCase()}`,
-              });
-            }
+            if (!line.startsWith('data:')) continue;
+            const p = line.slice(5).trim();
+            if (!p || p === '[DONE]') continue;
+            let v;
+            try { v = JSON.parse(p); } catch (_) { continue; }
+            if (v && v.error) { send(controller, { type: 'error', message: String(v.error.message || v.error) }); continue; }
+            let cand = null;
+            if (Array.isArray(v)) cand = v.find(x => typeof x === 'string');
+            else if (typeof v === 'string') cand = v;
+            else if (v && typeof v.output === 'string') cand = v.output;
+            if (cand == null) continue;
+            cand = String(cand);
+            send(controller, { type: 'delta', text: cand });
+            const mm = cand.match(/Qwen\s+2\.5\s+(7B|14B)/i);
+            if (mm) send(controller, { type: 'model', model: 'Qwen 2.5 ' + mm[1].toUpperCase() });
           }
         }
-
-        send(controller, { type: "done" });
+        send(controller, { type: 'done' });
         controller.close();
-      } catch (err) {
-        try {
-          send(controller, {
-            type: "error",
-            message: String(err.message || err),
-          });
-          send(controller, { type: "done" });
-        } catch {}
-        try {
-          controller.close();
-        } catch {}
-      } finally {
-        try {
-          reader.releaseLock();
-        } catch {}
-      }
+      } catch (e) {
+        try { send(controller, { type: 'error', message: String(e.message || e) }); } catch (_) {}
+        try { controller.close(); } catch (_) {}
+      } finally { try { reader.releaseLock(); } catch (_) {} }
     },
-
-    cancel() {
-      try {
-        reader.cancel();
-      } catch {}
-    },
+    cancel() { try { reader.cancel(); } catch (_) {} },
   });
-
-  return new Response(stream, {
-    status: 200,
-    headers: {
-      "content-type": "text/event-stream; charset=utf-8",
-      "cache-control": "no-cache, no-transform",
-      "connection": "keep-alive",
-      "x-accel-buffering": "no",
-    },
-  });
+  return new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache, no-transform', 'x-accel-buffering': 'no' } });
 }
 
-function openAIModelList(runtime) {
-  const now = Math.floor(Date.now() / 1000);
-  const models = [
-    ["riva-auto", "Auto"],
-    ["riva-7b", "Qwen 2.5 7B"],
-    ["riva-14b", "Qwen 2.5 14B"],
-  ];
-
-  return {
-    object: "list",
-    data: models.map(([id, name]) => ({
-      id,
-      object: "model",
-      created: now,
-      owned_by: "riva",
-      permission: [],
-      root: id,
-      parent: null,
-      name,
-      available: Boolean(runtime?.base),
-    })),
+async function handleApi(request, url, CFG) {
+  const m = request.method, p = url.pathname;
+  const stateRow = async () => {
+    const rows = await sb(CFG, 'app_state?select=current_url,desired_state,status&id=eq.' + encodeURIComponent(CFG.stateId));
+    return (rows && rows[0]) || {};
   };
-}
 
-function normalizeModelId(id) {
-  const value = String(id || "riva-auto").toLowerCase();
-
-  if (value === "riva-7b" || value === "7b" || value.includes("7b")) {
-    return "7b";
+  if (p === '/api/state' && m === 'GET') {
+    const state = await stateRow();
+    return json({ state, ping: await pingGradio(state.current_url, CFG) });
   }
 
-  if (value === "riva-14b" || value === "14b" || value.includes("14b")) {
-    return "14b";
+  if (p === '/api/power' && m === 'POST') {
+    const body = await request.json().catch(() => ({}));
+    const desired = body.desired_state === 'offline' ? 'offline' : 'online';
+    const rows = await sb(CFG, 'app_state?id=eq.' + encodeURIComponent(CFG.stateId), {
+      method: 'PATCH', body: { desired_state: desired, status: desired === 'online' ? 'starting' : 'stopping' } });
+    return json({ ok: true, state: rows && rows[0] });
   }
 
-  return "auto";
-}
-
-function extractMessagesText(messages) {
-  if (!Array.isArray(messages) || messages.length === 0) return "";
-
-  // The Gradio endpoint accepts one message. Preserve system/developer
-  // instructions as context before the latest user message.
-  const context = [];
-  let latestUser = "";
-
-  for (const item of messages) {
-    if (!item || typeof item !== "object") continue;
-
-    const role = String(item.role || "");
-    const content = messageContentToText(item.content);
-
-    if (!content) continue;
-
-    if (role === "system" || role === "developer") {
-      context.push(`[${role}]\n${content}`);
-    } else if (role === "user") {
-      latestUser = content;
-    }
-  }
-
-  if (!latestUser) {
-    const last = messages[messages.length - 1];
-    latestUser = messageContentToText(last?.content);
-  }
-
-  return context.length
-    ? `${context.join("\n\n")}\n\n[user]\n${latestUser}`
-    : latestUser;
-}
-
-function messageContentToText(content) {
-  if (typeof content === "string") return content.trim();
-
-  if (Array.isArray(content)) {
-    return content
-      .map(part => {
-        if (typeof part === "string") return part;
-        if (part?.type === "text") return String(part.text || "");
-        return "";
-      })
-      .join("")
-      .trim();
-  }
-
-  if (content && typeof content === "object") {
-    return String(content.text || content.content || "").trim();
-  }
-
-  return "";
-}
-
-async function handleOpenAI(request, url, cfg) {
-  const authError = requireApiKey(request, cfg);
-  if (authError) return withCors(authError, cfg);
-
-  if (url.pathname === "/v1/models") {
-    if (request.method !== "GET") {
-      return withCors(json({ error: "method not allowed" }, 405), cfg);
-    }
-
-    const runtime = await getRuntime(cfg);
-    return withCors(json(openAIModelList(runtime)), cfg);
-  }
-
-  if (url.pathname !== "/v1/chat/completions") {
-    return withCors(json({ error: "not found" }, 404), cfg);
-  }
-
-  if (request.method !== "POST") {
-    return withCors(json({ error: "method not allowed" }, 405), cfg);
-  }
-
-  const body = await readJson(request);
-
-  if (!Array.isArray(body.messages) || body.messages.length === 0) {
-    return withCors(json({
-      error: {
-        message: "messages must be a non-empty array.",
-        type: "invalid_request_error",
-      },
-    }, 400), cfg);
-  }
-
-  const message = extractMessagesText(body.messages);
-  if (!message) {
-    return withCors(json({
-      error: {
-        message: "No text message was provided.",
-        type: "invalid_request_error",
-      },
-    }, 400), cfg);
-  }
-
-  const runtime = await getRuntime(cfg);
-  if (!runtime.base) {
-    return withCors(json({
-      error: {
-        message: "RIVA is offline. No Gradio URL is available.",
-        type: "server_error",
-      },
-    }, 503), cfg);
-  }
-
-  const model = normalizeModelId(body.model);
-
-  // OpenAI streaming mode.
-  if (body.stream === true) {
-    const native = await streamRivaChat(
-      runtime.base,
-      message,
-      cfg,
-      String(body.conversation_id || crypto.randomUUID()),
-      model
-    );
-
-    if (!native.ok || !native.body) {
-      return withCors(native, cfg);
-    }
-
-    const decoder = new TextDecoder();
-    const encoder = new TextEncoder();
-    const reader = native.body.getReader();
-    let buffer = "";
-    const chatId = `chatcmpl-${crypto.randomUUID()}`;
-    const created = Math.floor(Date.now() / 1000);
-    const openAIModel = body.model || `riva-${model}`;
-
-    const stream = new ReadableStream({
-      async start(controller) {
-        const send = obj => {
-          controller.enqueue(
-            encoder.encode(`data: ${JSON.stringify(obj)}\n\n`)
-          );
-        };
-
-        try {
-          while (true) {
-            const { value, done } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-
-            const lines = buffer.split(/\r?\n/);
-            buffer = lines.pop() || "";
-
-            for (const line of lines) {
-              if (!line.startsWith("data:")) continue;
-
-              const raw = line.slice(5).trim();
-              if (!raw) continue;
-
-              let event;
-              try {
-                event = JSON.parse(raw);
-              } catch {
-                continue;
-              }
-
-              if (event.type === "delta" && event.text != null) {
-                send({
-                  id: chatId,
-                  object: "chat.completion.chunk",
-                  created,
-                  model: openAIModel,
-                  choices: [{
-                    index: 0,
-                    delta: { content: String(event.text) },
-                    finish_reason: null,
-                  }],
-                });
-              } else if (event.type === "error") {
-                send({
-                  id: chatId,
-                  object: "chat.completion.chunk",
-                  created,
-                  model: openAIModel,
-                  choices: [{
-                    index: 0,
-                    delta: {},
-                    finish_reason: "stop",
-                  }],
-                  error: {
-                    message: String(event.message || "Upstream error"),
-                    type: "server_error",
-                  },
-                });
-              }
-            }
-          }
-
-          send({
-            id: chatId,
-            object: "chat.completion.chunk",
-            created,
-            model: openAIModel,
-            choices: [{
-              index: 0,
-              delta: {},
-              finish_reason: "stop",
-            }],
-          });
-
-          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-          controller.close();
-        } catch (err) {
-          try {
-            send({
-              id: chatId,
-              object: "chat.completion.chunk",
-              created,
-              model: openAIModel,
-              choices: [{
-                index: 0,
-                delta: {},
-                finish_reason: "stop",
-              }],
-              error: {
-                message: String(err.message || err),
-                type: "server_error",
-              },
-            });
-            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-          } catch {}
-          try {
-            controller.close();
-          } catch {}
-        } finally {
-          try {
-            reader.releaseLock();
-          } catch {}
-        }
-      },
-      cancel() {
-        try {
-          reader.cancel();
-        } catch {}
-      },
-    });
-
-    return withCors(new Response(stream, {
-      status: 200,
-      headers: {
-        "content-type": "text/event-stream; charset=utf-8",
-        "cache-control": "no-cache, no-transform",
-        "connection": "keep-alive",
-        "x-accel-buffering": "no",
-      },
-    }), cfg);
-  }
-
-  try {
-    const result = await collectGradioReply(
-      runtime.base,
-      message,
-      cfg,
-      String(body.conversation_id || crypto.randomUUID()),
-      model
-    );
-
-    const promptTokens = Math.ceil(message.length / 4);
-    const completionTokens = Math.ceil(result.reply.length / 4);
-
-    return withCors(json({
-      id: `chatcmpl-${crypto.randomUUID()}`,
-      object: "chat.completion",
-      created: Math.floor(Date.now() / 1000),
-      model: body.model || `riva-${model}`,
-      choices: [{
-        index: 0,
-        message: {
-          role: "assistant",
-          content: result.reply,
-        },
-        finish_reason: "stop",
-      }],
-      usage: {
-        prompt_tokens: promptTokens,
-        completion_tokens: completionTokens,
-        total_tokens: promptTokens + completionTokens,
-      },
-    }), cfg);
-  } catch (err) {
-    console.error("OpenAI bridge error:", err);
-    return withCors(json({
-      error: {
-        message: String(err.message || err),
-        type: "upstream_error",
-      },
-    }, 502), cfg);
-  }
-}
-
-async function handleApi(request, url, cfg) {
-  const authError = requireApiKey(request, cfg);
-  if (authError) return withCors(authError, cfg);
-
-  const method = request.method;
-  const path = url.pathname;
-
-  if (path === "/api/state" && method === "GET") {
-    const runtime = await getRuntime(cfg);
-    const ping = await pingGradio(runtime.base, cfg);
-
-    return withCors(json({
-      ok: true,
-      state: {
-        current_url: runtime.base || null,
-        desired_state: runtime.desiredState,
-        status: runtime.status,
-      },
-      ping,
-    }), cfg);
-  }
-
-  if (path === "/api/power" && method === "POST") {
-    const body = await readJson(request);
-    const desired =
-      body.desired_state === "offline" ? "offline" : "online";
-
-    const rows = await supabase(
-      cfg,
-      `app_state?id=eq.${safeId(cfg.stateId)}`,
-      {
-        method: "PATCH",
-        body: {
-          desired_state: desired,
-          status: desired === "online" ? "starting" : "stopping",
-        },
-      }
-    );
-
-    return withCors(json({
-      ok: true,
-      state: rows?.[0] || null,
-    }), cfg);
-  }
-
-  if (path === "/api/conversations" && method === "GET") {
-    const rows = await supabase(
-      cfg,
-      "chat_messages?select=conversation_id,role,content,created_at&order=created_at.asc&limit=1000"
-    ) || [];
-
+  if (p === '/api/conversations' && m === 'GET') {
+    const rows = await sb(CFG, 'chat_messages?select=conversation_id,role,content,created_at&order=created_at.asc&limit=1000') || [];
     const seen = new Map();
-
     for (const row of rows) {
-      if (!row.conversation_id || row.conversation_id === "riva-super") {
-        continue;
-      }
-
-      const id = String(row.conversation_id);
-      const existing = seen.get(id);
-
-      if (!existing) {
-        seen.set(id, {
-          id,
-          title: row.role === "user"
-            ? String(row.content || "New chat").slice(0, 120)
-            : "Chat",
-          created_at: row.created_at,
-        });
-      } else if (
-        existing.title === "Chat" &&
-        row.role === "user"
-      ) {
-        existing.title = String(
-          row.content || "New chat"
-        ).slice(0, 120);
-      }
+      if (!row.conversation_id || row.conversation_id === 'riva-super') continue;
+      const s = seen.get(row.conversation_id);
+      if (!s) seen.set(row.conversation_id, { id: row.conversation_id, title: row.role === 'user' ? String(row.content || 'New chat').slice(0, 80) : 'Chat', created_at: row.created_at });
+      else if (s.title === 'Chat' && row.role === 'user') s.title = String(row.content || 'New chat').slice(0, 80);
     }
-
-    return withCors(json(
-      [...seen.values()].sort(
-        (a, b) =>
-          new Date(b.created_at) - new Date(a.created_at)
-      )
-    ), cfg);
+    return json([...seen.values()].sort((a, b) => new Date(b.created_at) - new Date(a.created_at)));
   }
 
-  if (path === "/api/conversations" && method === "POST") {
-    const body = await readJson(request);
-
-    return withCors(json({
-      id: crypto.randomUUID(),
-      title: String(body.title || "New chat").slice(0, 120),
-      created_at: new Date().toISOString(),
-    }, 201), cfg);
+  if (p === '/api/conversations' && m === 'POST') {
+    const body = await request.json().catch(() => ({}));
+    return json({ id: crypto.randomUUID(), title: String(body.title || 'New chat').slice(0, 120), created_at: new Date().toISOString() }, 201);
   }
 
-  if (
-    path.startsWith("/api/conversations/") &&
-    path.endsWith("/messages") &&
-    method === "GET"
-  ) {
-    const id = path.split("/")[3];
-
-    if (!id) {
-      return withCors(json({ error: "id required" }, 400), cfg);
-    }
-
-    const rows = await supabase(
-      cfg,
-      `chat_messages?select=id,conversation_id,role,content,created_at&conversation_id=eq.${safeId(id)}&order=created_at.asc&limit=200`
-    ) || [];
-
-    return withCors(json(
-      rows.map(row => ({
-        ...row,
-        sender: row.role,
-      }))
-    ), cfg);
+  if (p.startsWith('/api/conversations/') && p.endsWith('/messages') && m === 'GET') {
+    const id = p.split('/')[3];
+    const rows = await sb(CFG, 'chat_messages?select=id,conversation_id,role,content,created_at&conversation_id=eq.' + encodeURIComponent(id) + '&order=created_at.asc&limit=200') || [];
+    return json(rows.map(r => ({ ...r, sender: r.role })));
   }
 
-  if (
-    path.startsWith("/api/conversations/") &&
-    method === "DELETE"
-  ) {
-    const id = path.split("/")[3];
-
-    if (!id) {
-      return withCors(json({ error: "id required" }, 400), cfg);
-    }
-
-    await supabase(
-      cfg,
-      `chat_messages?conversation_id=eq.${safeId(id)}`,
-      { method: "DELETE" }
-    );
-
-    return withCors(json({ ok: true }), cfg);
+  // NEW: delete a chat
+  if (p.startsWith('/api/conversations/') && m === 'DELETE') {
+    const id = p.split('/')[3];
+    if (!id) return json({ error: 'id required' }, 400);
+    await sb(CFG, 'chat_messages?conversation_id=eq.' + encodeURIComponent(id), { method: 'DELETE' });
+    return json({ ok: true });
   }
 
-  if (path === "/api/model" && method === "POST") {
-    const body = await readJson(request);
-
-    if (!body.conversation_id) {
-      return withCors(json({
-        error: "conversation_id required",
-      }, 400), cfg);
-    }
-
-    const selection = normalizeModelId(body.model);
-
-    const runtime = await getRuntime(cfg);
-    if (!runtime.base) {
-      return withCors(json({
-        error: "RIVA is offline. No Gradio URL is available.",
-      }, 503), cfg);
-    }
-
-    try {
-      const result = await collectGradioReply(
-        runtime.base,
-        `/model ${selection}`,
-        cfg,
-        String(body.conversation_id),
-        "auto"
-      );
-
-      return withCors(json({
-        ok: true,
-        model: selection,
-        reply: result.reply || "",
-      }), cfg);
-    } catch (err) {
-      return withCors(json({
-        error: String(err.message || err),
-      }, 502), cfg);
-    }
+  if (p === '/api/model' && m === 'POST') {
+    const body = await request.json().catch(() => ({}));
+    if (!body.conversation_id) return json({ error: 'conversation_id required' }, 400);
+    const sel = String(body.model || 'auto').toLowerCase();
+    if (!['auto', '7b', '14b'].includes(sel)) return json({ error: 'model must be auto, 7b, or 14b' }, 400);
+    const st = await stateRow();
+    if (!st.current_url) return json({ error: 'RIVA is offline. No Gradio URL is available.' }, 503);
+    const reply = await runGradioCommand(st.current_url, '/model ' + sel, CFG, body.conversation_id);
+    if (!reply.ok) return json({ error: reply.error || 'Model selection failed.' }, 502);
+    return json({ ok: true, model: sel, reply: reply.reply || '' });
   }
 
-  if (path === "/api/chat" && method === "POST") {
-    const body = await readJson(request);
-
-    if (!body.conversation_id || !body.message) {
-      return withCors(json({
-        error: "conversation_id and message are required",
-      }, 400), cfg);
-    }
-
-    const runtime = await getRuntime(cfg);
-
-    return withCors(
-      await streamRivaChat(
-        runtime.base,
-        String(body.message),
-        cfg,
-        String(body.conversation_id),
-        normalizeModelId(body.model)
-      ),
-      cfg
-    );
+  if (p === '/api/chat' && m === 'POST') {
+    const body = await request.json().catch(() => ({}));
+    if (!body.conversation_id || !body.message) return json({ error: 'conversation_id & message required' }, 400);
+    const st = await stateRow();
+    return await streamGradioToBrowser(st.current_url, body.message, CFG, body.conversation_id, body.model || 'auto');
   }
 
-  if (path === "/api/stats" && method === "GET") {
-    const count = async table => {
+  if (p === '/api/stats' && m === 'GET') {
+    const count = async (table) => {
       try {
-        const response = await fetchWithTimeout(
-          `${cfg.supabaseUrl}/rest/v1/${table}?select=id&limit=1`,
-          {
-            headers: {
-              apikey: cfg.supabaseKey,
-              Authorization: `Bearer ${cfg.supabaseKey}`,
-              Prefer: "count=exact",
-              "Range-Unit": "items",
-              Range: "0-0",
-            },
-          },
-          15_000
-        );
-
-        if (!response.ok) return 0;
-
-        return Number(
-          String(response.headers.get("content-range") || "")
-            .split("/")[1]
-        ) || 0;
-      } catch {
-        return 0;
-      }
+        const r = await fetch(CFG.supabaseUrl + '/rest/v1/' + table + '?select=id&limit=1', {
+          headers: { apikey: CFG.supabaseKey, Authorization: 'Bearer ' + CFG.supabaseKey, Prefer: 'count=exact', 'Range-Unit': 'items', Range: '0-0' } });
+        return parseInt((r.headers.get('content-range') || '').split('/')[1] || '0', 10) || 0;
+      } catch { return 0; }
     };
-
-    const [memories, facts, chunks, msgs] = await Promise.all([
-      count("memories"),
-      count("facts"),
-      count("document_chunks"),
-      count("chat_messages"),
-    ]);
-
-    return withCors(json({
-      memories,
-      facts,
-      chunks,
-      msgs,
-    }), cfg);
+    const [memories, facts, chunks, msgs] = await Promise.all(['memories', 'facts', 'document_chunks', 'chat_messages'].map(count));
+    return json({ memories, facts, chunks, msgs });
   }
 
-  return withCors(json({ error: "not found" }, 404), cfg);
+  return json({ error: 'not found' }, 404);
 }
 
-
-const UI = String.raw`<!doctype html>
+/* Client page. RULES for editing: no backticks and no dollar-brace inside. */
+const HTML = String.raw`<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>RIVA</title>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<meta name="theme-color" content="#030906"/>
+<title>RIVA — Rishav Intelligent Virtual Assistant</title>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Sora:wght@600;700;800&display=swap" rel="stylesheet">
 <style>
-*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:transparent;font-family:Inter,system-ui,-apple-system,Segoe UI,Arial,sans-serif;color:#eef3ff}
-#riva-toggle{display:none}
-#riva-pet{position:fixed;right:24px;bottom:24px;width:78px;height:78px;border:0;border-radius:50%;z-index:2147483647;cursor:pointer;background:linear-gradient(145deg,#7057ff,#18bfff);box-shadow:0 12px 38px #0008,0 0 38px #635bff66;display:flex;align-items:center;justify-content:center;transition:.2s}
-#riva-pet:hover{transform:scale(1.07);box-shadow:0 16px 45px #000a,0 0 50px #635bff99}
-.pet-ring{position:absolute;inset:-8px;border:2px solid #6ee7ff66;border-radius:50%;animation:pulse 2s infinite}
-.pet-face{position:relative;width:52px;height:42px;border:2px solid #aab8ff;border-radius:17px;background:#11182d;box-shadow:inset 0 0 16px #0009}
-.pet-eye{position:absolute;top:11px;width:8px;height:10px;border-radius:50%;background:#61e7ff;box-shadow:0 0 12px #61e7ff}.pet-eye.left{left:10px}.pet-eye.right{right:10px}
-.pet-mouth{position:absolute;left:17px;top:28px;width:14px;height:5px;border-bottom:2px solid #fff;border-radius:50%}
-.pet-status{position:absolute;right:-1px;top:-1px;width:18px;height:18px;border:3px solid #11182d;border-radius:50%;background:#55ef9b}
-#riva-popup{position:fixed;right:24px;bottom:116px;width:410px;height:600px;max-width:calc(100vw - 28px);max-height:calc(100vh - 135px);z-index:2147483646;display:flex;flex-direction:column;overflow:hidden;opacity:0;visibility:hidden;pointer-events:none;transform:translateY(18px) scale(.96);transform-origin:bottom right;background:#080d1b;border:1px solid #ffffff18;border-radius:22px;box-shadow:0 28px 85px #000c,0 0 55px #635bff22;transition:opacity .18s ease,transform .18s ease,visibility .18s ease}
-#riva-toggle:checked~#riva-popup{opacity:1;visibility:visible;pointer-events:auto;transform:translateY(0) scale(1)}
-.riva-header{height:68px;flex:0 0 68px;display:flex;align-items:center;gap:10px;padding:10px 12px;background:#10162a;border-bottom:1px solid #ffffff12}.riva-avatar{width:43px;height:43px;border-radius:14px;display:grid;place-items:center;background:linear-gradient(145deg,#7057ff,#18bfff)}.mini-face{width:27px;height:21px;border-radius:8px;background:#11182d;position:relative}.mini-face:after{content:"••";position:absolute;left:7px;top:2px;color:#61e7ff;font-size:10px;letter-spacing:4px}.riva-title{flex:1;min-width:0}.riva-title strong{display:block;font-size:15px}.riva-title small{display:block;color:#7f8ba7;font-size:10px;margin-top:3px}.riva-close{width:36px;height:36px;border:0;border-radius:10px;background:#ffffff0a;color:#dce3f4;font-size:22px;display:grid;place-items:center;cursor:pointer}
-#riva-messages{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;padding:14px;background:#080d1b;scrollbar-width:thin}#riva-messages::-webkit-scrollbar{width:6px}#riva-messages::-webkit-scrollbar-thumb{background:#ffffff20;border-radius:10px}
-.riva-message{display:flex;width:100%;margin:0 0 10px}.riva-message.user{justify-content:flex-end}.riva-bubble{max-width:86%;padding:10px 12px;border-radius:15px;font-size:13px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}.riva-message.assistant .riva-bubble{background:#151c30;border:1px solid #ffffff0d}.riva-message.user .riva-bubble{background:linear-gradient(135deg,#6753ee,#258df5)}
-.riva-actions{display:flex;gap:7px;overflow-x:auto;flex:0 0 auto;padding:9px 11px;background:#0b1020;border-top:1px solid #ffffff0b}.riva-action{flex:0 0 auto;border:1px solid #ffffff12;background:#ffffff07;color:#aeb9d2;border-radius:10px;padding:7px 10px;font-size:10px;cursor:pointer}
-.riva-composer{display:flex;align-items:flex-end;gap:7px;padding:10px 11px 7px;background:#0b1020}.riva-composer textarea{flex:1;min-width:0;min-height:43px;max-height:110px;resize:none;border:1px solid #ffffff12;border-radius:14px;background:#060a15;color:#fff;outline:0;padding:12px;font:inherit;font-size:13px}.riva-composer textarea:focus{border-color:#718cff88}.riva-mic,.riva-send{width:43px;height:43px;flex:0 0 43px;border-radius:13px;cursor:pointer}.riva-mic{border:1px solid #ffffff12;background:#ffffff08;color:#dce5ff;font-size:16px}.riva-mic.active{background:#ef4444;color:#fff}.riva-send{border:0;background:linear-gradient(135deg,#735aff,#23bfff);color:#fff;font-size:17px;font-weight:700}.riva-send:disabled{opacity:.4}.riva-footer{height:24px;flex:0 0 24px;display:grid;place-items:center;color:#56627a;background:#0b1020;font-size:9px}
-@keyframes pulse{0%{transform:scale(.9);opacity:.7}70%,100%{transform:scale(1.25);opacity:0}}
-@media(max-width:600px){#riva-pet{width:64px;height:64px;right:14px;bottom:14px}.pet-face{transform:scale(.84)}#riva-popup{left:7px;right:7px;bottom:84px;width:auto;max-width:none;height:calc(100vh - 96px);max-height:none;border-radius:18px;transform-origin:bottom center}}
+:root{--bg:#030906;--glass:rgba(16,34,26,.45);--glass2:rgba(10,22,17,.72);--line:rgba(110,255,190,.14);--line2:rgba(255,255,255,.08);--text:#e8fff3;--mute:#7e9b8d;--a:#2dffa0;--a2:#19c9a6;--bad:#ff5a74;--r:22px}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;scrollbar-width:thin;scrollbar-color:rgba(45,255,160,.25) transparent}
+html,body{height:100%;margin:0}
+body{height:100dvh;overflow:hidden;color:var(--text);font-family:Manrope,system-ui,sans-serif;background:radial-gradient(900px 700px at 90% -10%,rgba(45,255,160,.16),transparent 60%),radial-gradient(800px 700px at -10% 100%,rgba(25,201,166,.13),transparent 55%),var(--bg)}
+button,input,textarea,select{font:inherit;color:inherit}
+button{cursor:pointer}
+.hidden{display:none!important}
+/* background watermark: frosted water-glass lettering */
+.wm{position:fixed;inset:0;display:grid;place-items:center;pointer-events:none;z-index:0;text-align:center}
+.wm b{display:block;font:800 clamp(110px,26vw,380px)/.9 Sora;letter-spacing:-.06em;color:rgba(255,255,255,.035);background:linear-gradient(180deg,rgba(120,255,200,.20),rgba(120,255,200,.02) 70%);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;filter:drop-shadow(0 0 40px rgba(45,255,160,.12))}
+.wm small{display:block;margin-top:6px;font:600 clamp(10px,1.6vw,16px) Manrope;letter-spacing:.38em;color:rgba(160,255,215,.16)}
+.orb{position:fixed;border-radius:50%;filter:blur(70px);pointer-events:none;z-index:0;opacity:.5;animation:drift 18s ease-in-out infinite alternate}
+.orb.o1{width:340px;height:340px;background:#10b981;top:10%;left:30%}.orb.o2{width:280px;height:280px;background:#06b6d4;bottom:5%;right:10%;animation-delay:-8s}
+@keyframes drift{to{transform:translate(60px,-40px) scale(1.15)}}
+.app{position:relative;z-index:1;height:100dvh;display:flex}
+.glass{background:var(--glass);backdrop-filter:blur(26px) saturate(170%);-webkit-backdrop-filter:blur(26px) saturate(170%);border:1px solid var(--line);box-shadow:0 20px 60px rgba(0,0,0,.45),inset 0 1px 0 rgba(255,255,255,.07)}
+/* sidebar */
+.side{width:290px;min-width:290px;display:flex;flex-direction:column;background:var(--glass2);backdrop-filter:blur(30px) saturate(170%);-webkit-backdrop-filter:blur(30px) saturate(170%);border-right:1px solid var(--line);padding-top:env(safe-area-inset-top);transition:transform .28s cubic-bezier(.3,.8,.2,1);z-index:30}
+.brand{display:flex;align-items:center;gap:11px;padding:18px 16px 12px}
+.brand h1{margin:0;font:800 19px Sora;letter-spacing:.02em}.brand p{margin:1px 0 0;font-size:10.5px;color:var(--mute)}
+.btn-new{margin:4px 14px 10px;padding:12px;border-radius:14px;border:1px solid rgba(45,255,160,.4);background:linear-gradient(135deg,rgba(45,255,160,.2),rgba(25,201,166,.07));font-weight:700;color:var(--a)}
+.btn-new:hover{box-shadow:0 0 26px rgba(45,255,160,.22);color:#fff}
+.nav{display:flex;gap:6px;padding:0 14px 10px}
+.nav button{flex:1;padding:9px 4px;border-radius:12px;border:1px solid transparent;background:transparent;color:var(--mute);font-size:11.5px;font-weight:600}
+.nav button.on{background:rgba(45,255,160,.12);border-color:rgba(45,255,160,.3);color:#fff}
+.search{margin:0 14px 8px;padding:10px 12px;border-radius:12px;border:1px solid var(--line);background:rgba(0,0,0,.28);outline:none;font-size:13px}
+.search:focus{border-color:rgba(45,255,160,.55)}
+.hist{flex:1;overflow:auto;padding:2px 10px}
+.hi{display:flex;align-items:center;gap:4px;border-radius:12px;margin-bottom:3px;border:1px solid transparent}
+.hi:hover{background:rgba(45,255,160,.07)}.hi.on{background:rgba(45,255,160,.13);border-color:rgba(45,255,160,.3)}
+.hi .open{flex:1;min-width:0;text-align:left;background:none;border:0;padding:10px}
+.hi .t{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.hi .d{font-size:10px;color:var(--mute);margin-top:2px}
+.hi .del{width:32px;height:32px;margin-right:4px;border-radius:9px;border:0;background:none;color:var(--mute);opacity:.65}
+.hi .del:hover{background:rgba(255,90,116,.15);color:var(--bad);opacity:1}
+.sfoot{padding:12px 14px calc(12px + env(safe-area-inset-bottom));border-top:1px solid var(--line);display:flex;align-items:center;gap:9px;font-size:12px;font-weight:700}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--bad);flex:none}.dot.live{background:var(--a);box-shadow:0 0 12px var(--a)}
+.scrim{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:25;backdrop-filter:blur(3px)}
+/* main */
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+.top{display:flex;align-items:center;gap:10px;padding:calc(10px + env(safe-area-inset-top)) 16px 10px;border-bottom:1px solid var(--line);background:rgba(3,9,6,.5);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px)}
+.ib{width:40px;height:40px;border-radius:12px;border:1px solid var(--line);background:var(--glass);display:grid;place-items:center;font-size:17px;flex:none}
+.ib:hover{border-color:rgba(45,255,160,.5);color:var(--a)}
+.burger{display:none}
+.top h2{margin:0;font:700 17px Sora;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pill{display:flex;align-items:center;gap:7px;padding:7px 12px;border-radius:99px;font-size:11.5px;font-weight:600;background:var(--glass);border:1px solid var(--line)}
+.content{flex:1;min-height:0;position:relative}
+.view{position:absolute;inset:0;overflow:auto}
+.chat{display:flex;flex-direction:column}
+.scroll{flex:1;min-height:0;overflow:auto;padding:22px clamp(14px,5vw,80px) 10px}
+.empty{min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:10px;padding:10px}
+.empty h3{margin:6px 0 0;font:800 clamp(26px,5vw,42px) Sora;letter-spacing:-.03em}
+.empty p{margin:0;color:var(--mute);max-width:440px;line-height:1.6;font-size:14px}
+.chips{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:10px}
+.chip{padding:9px 14px;border-radius:99px;border:1px solid var(--line);background:var(--glass);font-size:12.5px;color:#b9d6c8}
+.chip:hover{border-color:rgba(45,255,160,.55);color:#fff}
+.msg{display:flex;gap:11px;max-width:900px;margin:0 auto 20px}
+.msg.user{flex-direction:row-reverse}
+.av{width:34px;height:34px;border-radius:12px;flex:none;display:grid;place-items:center;font:800 12px Sora}
+.av.ai{background:linear-gradient(135deg,var(--a),#059669);color:#03150c}.av.user{background:rgba(255,255,255,.09);border:1px solid var(--line2)}
+.body{max-width:min(88%,820px);min-width:0}
+.bub{font-size:15px;line-height:1.7;overflow-wrap:anywhere}
+.msg.user .bub{padding:11px 15px;border-radius:20px 20px 6px 20px;background:linear-gradient(135deg,rgba(45,255,160,.92),rgba(25,201,166,.9));color:#02140b;font-weight:600;white-space:pre-wrap}
+.bub p{margin:8px 0}.bub ul,.bub ol{padding-left:22px}.bub strong{color:#a7f3d0}
+.bub code{background:rgba(0,0,0,.45);border:1px solid var(--line);border-radius:6px;padding:1px 6px;font-size:.88em;color:#86efac}
+.bub pre{background:rgba(0,0,0,.5);border:1px solid var(--line);border-radius:14px;padding:14px;overflow:auto}.bub pre code{background:none;border:0;padding:0}
+.bub blockquote{margin:8px 0;border-left:3px solid var(--a);padding-left:12px;color:#a7c4b6}
+.meta{font-size:10px;color:var(--mute);margin-top:4px}
+.caret{display:inline-block;width:7px;height:16px;margin-left:2px;border-radius:2px;background:var(--a);vertical-align:-3px;animation:bl 1s infinite}@keyframes bl{50%{opacity:.15}}
+/* composer — Claude-style */
+.cwrap{padding:6px clamp(12px,5vw,80px) calc(10px + env(safe-area-inset-bottom))}
+.comp{max-width:900px;margin:0 auto;border-radius:26px;background:var(--glass2);backdrop-filter:blur(28px) saturate(170%);-webkit-backdrop-filter:blur(28px) saturate(170%);border:1px solid var(--line);box-shadow:0 18px 55px rgba(0,0,0,.5);transition:.18s}
+.comp:focus-within{border-color:rgba(45,255,160,.6);box-shadow:0 18px 55px rgba(0,0,0,.5),0 0 0 4px rgba(45,255,160,.08)}
+.ta{display:block;width:100%;min-height:54px;max-height:42dvh;resize:none;background:transparent;border:0;outline:0;padding:16px 18px 6px;font-size:16px;line-height:1.5}
+.ta::placeholder{color:#58705f}
+.att{margin:2px 14px 0;display:inline-flex;align-items:center;gap:8px;font-size:12px;color:var(--a);background:rgba(45,255,160,.1);padding:5px 10px;border-radius:99px}
+.att button{background:none;border:0;color:var(--mute);padding:0}
+.crow{display:flex;align-items:center;gap:6px;padding:6px 10px 10px;position:relative}
+.cb{width:38px;height:38px;border-radius:50%;border:1px solid var(--line);background:transparent;display:grid;place-items:center;font-size:18px;color:#a9c8b9}
+.cb:hover{background:rgba(45,255,160,.1);color:var(--a)}
+.mchip{display:flex;align-items:center;gap:6px;height:38px;padding:0 12px;border-radius:99px;border:1px solid var(--line);background:transparent;font-size:12.5px;font-weight:600;color:#c4e4d4}
+.mchip:hover{background:rgba(45,255,160,.1)}
+.send{margin-left:auto;width:42px;height:42px;border-radius:50%;border:0;background:linear-gradient(135deg,var(--a),#10b981);color:#02140b;font-size:19px;font-weight:900;box-shadow:0 0 22px rgba(45,255,160,.35)}
+.send:disabled{opacity:.4;box-shadow:none}
+.menu{position:absolute;bottom:56px;left:52px;min-width:250px;padding:6px;border-radius:18px;background:rgba(8,18,14,.96);border:1px solid var(--line);box-shadow:0 20px 50px rgba(0,0,0,.6);z-index:10}
+.menu button{display:block;width:100%;text-align:left;padding:10px 12px;border-radius:12px;border:0;background:none}
+.menu button:hover,.menu button.on{background:rgba(45,255,160,.12)}
+.menu b{display:block;font-size:13px}.menu span{font-size:11px;color:var(--mute)}
+.status{max-width:900px;margin:7px auto 0;display:flex;align-items:center;justify-content:center;gap:8px;font-size:11.5px;color:var(--mute);flex-wrap:wrap}
+.status b{color:#c4e4d4;font-weight:700}.status i{opacity:.4;font-style:normal}
+/* sections */
+.sec{max-width:1000px;margin:0 auto;padding:24px clamp(14px,4vw,32px) 90px}
+.sec h3{font:800 26px Sora;margin:0 0 4px}.lead{color:var(--mute);font-size:13px;margin:0 0 18px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px}
+.card{border-radius:var(--r);padding:18px}.card h4{margin:0 0 6px;font:700 15px Sora}.card p{margin:0;font-size:12.5px;line-height:1.6;color:var(--mute)}
+.row{display:flex;gap:10px;margin-bottom:16px}
+.inp{flex:1;min-width:0;padding:13px 14px;border-radius:14px;border:1px solid var(--line);background:rgba(0,0,0,.3);outline:none;font-size:15px}.inp:focus{border-color:rgba(45,255,160,.55)}
+.pbtn{padding:0 18px;border-radius:14px;border:0;font-weight:800;color:#02140b;background:linear-gradient(135deg,var(--a),#10b981);min-height:44px}
+.gbtn{padding:11px 16px;border-radius:14px;border:1px solid var(--line);background:var(--glass);font-weight:700}
+.big{font:800 36px Sora;color:var(--a);margin:4px 0}
+.sr{display:flex;justify-content:space-between;gap:12px;border-top:1px solid var(--line2);padding:10px 0;font-size:12.5px}.sr span:first-child{color:var(--mute)}.sr span:last-child{text-align:right;word-break:break-all}
+/* avatar + pet */
+.avatar-card{display:flex;align-items:center;gap:16px}
+#rivaAvatar{width:92px;height:92px;flex:none}
+.eye{transform-box:fill-box;transform-origin:center;animation:blinkE 5s infinite}@keyframes blinkE{0%,94%,100%{transform:scaleY(1)}97%{transform:scaleY(.1)}}
+.st-think #rivaAvatar{animation:spin 2.4s linear infinite}.st-talk .mouth{animation:talk .3s ease-in-out infinite alternate}
+@keyframes spin{to{transform:rotate(360deg)}}@keyframes talk{to{transform:scaleY(2.2)}}
+.mouth{transform-box:fill-box;transform-origin:center}
+.float{animation:fl 4s ease-in-out infinite}@keyframes fl{50%{transform:translateY(-6px)}}
+.pet{position:fixed;right:14px;bottom:calc(150px + env(safe-area-inset-bottom));z-index:12;display:flex;flex-direction:column;align-items:center;gap:4px}
+.pet .face{width:54px;height:54px;border-radius:50%;border:1px solid var(--line);background:var(--glass2);backdrop-filter:blur(14px);display:grid;place-items:center;font-size:30px;animation:fl 3s ease-in-out infinite;box-shadow:0 8px 28px rgba(0,0,0,.4)}
+.pet .face:active{transform:scale(.88)}
+.pet .say{max-width:150px;font-size:11px;padding:6px 10px;border-radius:12px;background:var(--glass2);border:1px solid var(--line);text-align:center}
+.pet .bars{width:54px;height:4px;border-radius:9px;background:rgba(255,255,255,.1);overflow:hidden}.pet .bars i{display:block;height:100%;background:var(--a);transition:width .4s}
+.petpanel{position:fixed;right:14px;bottom:calc(230px + env(safe-area-inset-bottom));width:210px;padding:12px;border-radius:18px;z-index:13}
+.petpanel .sr{padding:6px 0;font-size:12px}
+.petpanel .acts{display:flex;gap:6px;margin-top:8px}.petpanel .acts button{flex:1;padding:8px 4px;border-radius:10px;border:1px solid var(--line);background:rgba(45,255,160,.08);font-size:12px}
+/* super chat */
+.super{position:fixed;left:304px;bottom:18px;width:320px;height:420px;border-radius:22px;z-index:20;display:flex;flex-direction:column;overflow:hidden}
+.super .sh{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--line);font:700 13px Sora}
+.super .sh span{flex:1}.super .sh button{width:28px;height:28px;border:0;border-radius:8px;background:none;color:var(--mute)}
+.super .sm{flex:1;overflow:auto;padding:10px}
+.super .m{font-size:13px;line-height:1.5;margin-bottom:8px;padding:8px 11px;border-radius:14px;max-width:92%;overflow-wrap:anywhere}
+.super .m.u{margin-left:auto;background:rgba(45,255,160,.85);color:#02140b;font-weight:600}.super .m.a{background:rgba(255,255,255,.07)}
+.super .m p{margin:4px 0}
+.super .sf{display:flex;gap:6px;padding:8px;border-top:1px solid var(--line)}
+.super input{flex:1;min-width:0;padding:10px 12px;border-radius:12px;border:1px solid var(--line);background:rgba(0,0,0,.3);outline:none;font-size:16px}
+.super .sf button{width:40px;border:0;border-radius:12px;background:var(--a);color:#02140b;font-weight:900}
+.toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(110px + env(safe-area-inset-bottom));z-index:60;max-width:min(520px,92vw);padding:12px 16px;border-radius:14px;background:rgba(8,22,16,.95);border:1px solid rgba(45,255,160,.4);font-size:13px}
+/* mobile */
+@media(max-width:820px){
+  .side{position:fixed;inset:0 auto 0 0;width:min(86vw,320px);transform:translateX(-102%)}
+  .side.open{transform:none;box-shadow:20px 0 60px rgba(0,0,0,.6)}
+  .burger{display:grid}.pill .pt{display:none}
+  .super{left:10px;right:10px;width:auto;bottom:calc(10px + env(safe-area-inset-bottom));height:min(62dvh,480px)}
+  .msg .body{max-width:calc(100% - 46px)}
+  .pet{bottom:calc(168px + env(safe-area-inset-bottom))}.petpanel{bottom:calc(250px + env(safe-area-inset-bottom))}
+}
+@media(prefers-reduced-motion:reduce){*{animation:none!important}}
 </style>
 </head>
 <body>
-<input id="riva-toggle" type="checkbox">
-<label id="riva-pet" for="riva-toggle" title="Open RIVA">
-  <span class="pet-ring"></span><span class="pet-face"><span class="pet-eye left"></span><span class="pet-eye right"></span><span class="pet-mouth"></span></span><span class="pet-status"></span>
-</label>
-<section id="riva-popup">
-  <header class="riva-header">
-    <div class="riva-avatar"><div class="mini-face"></div></div>
-    <div class="riva-title"><strong>RIVA</strong><small id="riva-status">Online · Quick Chat</small></div>
-    <label class="riva-close" for="riva-toggle" title="Close">×</label>
-  </header>
-  <main id="riva-messages">
-    <div class="riva-message assistant"><div class="riva-bubble">Hi 👋 I'm RIVA. Click the pet whenever you want a quick conversation.</div></div>
-  </main>
-  <div class="riva-actions">
-    <button class="riva-action" data-q="What can you do?">What can you do?</button>
-    <button class="riva-action" data-q="Explain this simply: ">Explain simply</button>
-    <button class="riva-action" data-q="Help me plan: ">Help me plan</button>
+<div class="wm"><div><b>RIVA</b><small>RISHAV INTELLIGENT VIRTUAL ASSISTANT</small></div></div>
+<div class="orb o1"></div><div class="orb o2"></div>
+<div class="app" id="app">
+<aside class="side" id="side">
+  <div class="brand"><svg width="40" height="40" viewBox="0 0 40 40"><defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2dffa0"/><stop offset="1" stop-color="#059669"/></linearGradient></defs><rect width="40" height="40" rx="13" fill="url(#lg)"/><text x="20" y="27" text-anchor="middle" font-family="Sora" font-weight="800" font-size="21" fill="#03150c">R</text></svg><div><h1>RIVA</h1><p>Rishav Intelligent Virtual Assistant</p></div></div>
+  <button type="button" class="btn-new" id="newChatBtn">＋ New chat</button>
+  <div class="nav" id="nav"><button type="button" class="on" data-view="chat">Chat</button><button type="button" data-view="projects">Projects</button><button type="button" data-view="server">Server</button></div>
+  <input class="search" id="search" placeholder="Search chats"/>
+  <div class="hist" id="hist"></div>
+  <div class="sfoot"><span class="dot" id="sDot"></span><span id="sTxt">CHECKING</span><span style="margin-left:auto;color:var(--mute);font-weight:600" id="sSub"></span></div>
+</aside>
+<div class="scrim hidden" id="scrim"></div>
+<main class="main">
+  <header class="top"><button type="button" class="ib burger" id="burger" aria-label="Menu">☰</button><h2 id="vTitle">Chat</h2><button type="button" class="ib" id="superBtn" title="Super chat">⚡</button><button type="button" class="ib" id="petBtn" title="Virtual pet">🐾</button><div class="pill"><span class="dot" id="tDot"></span><span class="pt" id="tTxt">…</span></div></header>
+  <div class="content">
+    <section id="v-chat" class="view chat">
+      <div class="scroll" id="scroll"></div>
+      <div class="cwrap">
+        <div class="comp">
+          <textarea id="ta" class="ta" rows="1" placeholder="Message RIVA…" enterkeyhint="send"></textarea>
+          <div id="attBox" class="hidden"></div>
+          <div class="crow">
+            <input type="file" id="file" class="hidden"/>
+            <button type="button" class="cb" id="attBtn" title="Attach file">＋</button>
+            <button type="button" class="mchip" id="mBtn" title="Switch model">◈ <span id="mLbl">Auto</span> ▾</button>
+            <div class="menu hidden" id="menu">
+              <button type="button" data-m="auto"><b>Auto</b><span>RIVA picks 7B or 14B</span></button>
+              <button type="button" data-m="7b"><b>Qwen 2.5 7B</b><span>Fast replies</span></button>
+              <button type="button" data-m="14b"><b>Qwen 2.5 14B</b><span>Smarter, slower</span></button>
+            </div>
+            <button type="button" class="send" id="send" aria-label="Send">↑</button>
+          </div>
+        </div>
+        <div class="status"><span>Model</span><b id="stModel">Auto routing</b><i>•</i><span id="stState">checking server…</span></div>
+      </div>
+    </section>
+    <section id="v-projects" class="view hidden"><div class="sec"><h3>Projects</h3><p class="lead">Start a focused chat for each project.</p><div class="row"><input class="inp" id="pName" placeholder="Project name"/><button type="button" class="pbtn" id="pAdd">Create</button></div><div class="grid" id="pGrid"></div></div></section>
+    <section id="v-server" class="view hidden"><div class="sec"><h3>Server</h3><p class="lead">Start or stop the Kaggle runtime.</p>
+      <div class="grid"><div class="card glass"><div class="big" id="bigS">…</div><p id="subS" style="margin-bottom:12px"></p><div class="sr"><span>Desired</span><span id="desS">—</span></div><div class="sr"><span>Latency</span><span id="latS">—</span></div><div class="row" style="margin:14px 0 0"><button type="button" class="pbtn" data-power="online" style="flex:1">Start</button><button type="button" class="gbtn" data-power="offline" style="flex:1">Stop</button></div></div>
+      <div class="card glass"><h4>Endpoint</h4><p id="urlS" style="font-family:monospace;word-break:break-all">—</p><div class="sr"><span>Database status</span><span id="dbS">—</span></div></div>
+      <div class="card glass"><h4>Storage</h4><div id="stats"></div></div></div></div></section>
   </div>
-  <div class="riva-composer">
-    <button class="riva-mic" id="riva-mic" title="Voice input">🎙</button>
-    <textarea id="riva-input" rows="1" placeholder="Ask RIVA..."></textarea>
-    <button class="riva-send" id="riva-send">➤</button>
-  </div>
-  <footer class="riva-footer">RIVA Quick Assistant</footer>
-</section>
+</main>
+</div>
+
+<div class="pet hidden" id="pet"><div class="say" id="petSay"></div><div class="face" id="petFace">🐱</div><div class="bars"><i id="petBar"></i></div></div>
+<div class="petpanel glass hidden" id="petPanel"><div class="sr"><span>Name</span><span id="pN">Riv</span></div><div class="sr"><span>Mood</span><span id="pM"></span></div><div class="sr"><span>Hunger</span><span id="pH"></span></div><div class="sr"><span>Level</span><span id="pL"></span></div><div class="acts"><button type="button" id="pFeed">🍖 Feed</button><button type="button" id="pPlay">🎾 Play</button><button type="button" id="pNap">💤 Nap</button></div></div>
+
+<div class="super glass hidden" id="super"><div class="sh"><span>⚡ Super chat</span><button type="button" id="sClear" title="Clear">⌫</button><button type="button" id="sClose" title="Close">✕</button></div><div class="sm" id="sMsgs"></div><div class="sf"><input id="sIn" placeholder="Quick message…" enterkeyhint="send"/><button type="button" id="sGo">↑</button></div></div>
+
 <script>
 (function(){
-  const input=document.getElementById('riva-input');
-  const send=document.getElementById('riva-send');
-  const messages=document.getElementById('riva-messages');
-  const status=document.getElementById('riva-status');
-  const mic=document.getElementById('riva-mic');
-  let busy=false;
-  let conversationId=localStorage.getItem('riva_conversation')||crypto.randomUUID();
-  localStorage.setItem('riva_conversation',conversationId);
+'use strict';
+var $=function(s){return document.querySelector(s)};
+var cur=null,convs=[],attached=null,busy=false,model='auto',live=false,projects=[],modelName='';
+var SUPER_ID='riva-super';
 
-  function addMessage(role,text){
-    const row=document.createElement('div');row.className='riva-message '+role;
-    const bubble=document.createElement('div');bubble.className='riva-bubble';bubble.textContent=text;
-    row.appendChild(bubble);messages.appendChild(row);messages.scrollTop=messages.scrollHeight;return bubble;
-  }
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+function md(s){if(window.marked){try{marked.setOptions({breaks:true,gfm:true});return marked.parse(String(s||''))}catch(e){}}return esc(s).replace(/\n/g,'<br>')}
+function toast(m){var t=document.createElement('div');t.className='toast';t.textContent=String(m&&m.message||m);document.body.appendChild(t);setTimeout(function(){t.remove()},4500)}
+function api(path,opt){return fetch(path,opt).then(function(r){return r.json().catch(function(){return{}}).then(function(d){if(!r.ok)throw new Error(d.error||('Request failed ('+r.status+')'));return d})})}
+function post(path,body){return api(path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)})}
 
-  async function sendMessage(){
-    if(busy)return;const text=input.value.trim();if(!text)return;
-    busy=true;send.disabled=true;input.value='';input.style.height='43px';
-    addMessage('user',text);const answer=addMessage('assistant','');status.textContent='Thinking...';
-    try{
-      const headers={'Content-Type':'application/json'};
-      const key=localStorage.getItem('riva_api_key');if(key)headers.Authorization='Bearer '+key;
-      const response=await fetch('/v1/chat/completions',{method:'POST',headers,body:JSON.stringify({model:'riva-auto',messages:[{role:'user',content:text}],stream:true,conversation_id:conversationId})});
-      if(!response.ok)throw new Error((await response.text()).slice(0,500)||('HTTP '+response.status));
-      if(!response.body)throw new Error('Streaming response is unavailable.');
-      const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='',full='';
-      while(true){
-        const r=await reader.read();if(r.done)break;buffer+=decoder.decode(r.value,{stream:true});
-        const lines=buffer.split(/\r?\n/);buffer=lines.pop()||'';
-        for(const line of lines){
-          if(!line.startsWith('data:'))continue;const raw=line.slice(5).trim();if(raw==='[DONE]')continue;
-          try{const data=JSON.parse(raw);const delta=data?.choices?.[0]?.delta?.content;if(delta){full+=delta;answer.textContent=full;messages.scrollTop=messages.scrollHeight}if(data?.error)throw new Error(data.error.message||'Server error');}catch(e){if(e?.message&&e.message!=='Unexpected end of JSON input'){} }
-        }
-      }
-      if(!full)answer.textContent='No response received.';status.textContent='Online · Ready';
-      if(localStorage.getItem('riva_speak')==='1'&&'speechSynthesis' in window){speechSynthesis.cancel();speechSynthesis.speak(new SpeechSynthesisUtterance(full));}
-    }catch(e){answer.textContent='⚠ '+(e.message||'Connection error');status.textContent='Connection error';}
-    finally{busy=false;send.disabled=false;input.focus();}
-  }
+/* ---------- RIVA avatar (SVG face, reacts to state) ---------- */
+var AVATAR='<svg id="rivaAvatar" viewBox="0 0 100 100"><defs><radialGradient id="ag" cx="35%" cy="30%"><stop offset="0" stop-color="#8dffcf"/><stop offset=".6" stop-color="#19c9a6"/><stop offset="1" stop-color="#047857"/></radialGradient></defs><circle cx="50" cy="50" r="44" fill="url(#ag)"/><circle cx="50" cy="50" r="44" fill="none" stroke="rgba(255,255,255,.35)" stroke-width="1.5"/><ellipse cx="36" cy="26" rx="14" ry="7" fill="rgba(255,255,255,.28)"/><g class="eye"><circle id="eL" cx="37" cy="46" r="5.5" fill="#03150c"/></g><g class="eye"><circle id="eR" cx="63" cy="46" r="5.5" fill="#03150c"/></g><rect class="mouth" x="43" y="62" width="14" height="3.5" rx="1.75" fill="#03150c"/></svg>';
+function avatarState(s){var a=$('#avWrap');if(a)a.className='float st-'+s}
+document.addEventListener('pointermove',function(e){var svg=$('#rivaAvatar');if(!svg)return;var r=svg.getBoundingClientRect(),dx=(e.clientX-(r.left+r.width/2)),dy=(e.clientY-(r.top+r.height/2)),d=Math.max(1,Math.hypot(dx,dy)),k=Math.min(3,d/60);['eL','eR'].forEach(function(id,i){var el=$('#'+id);if(el)el.setAttribute('transform','translate('+(dx/d*k)+','+(dy/d*k)+')')})});
 
-  send.onclick=sendMessage;
-  input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMessage()}});
-  input.addEventListener('input',()=>{input.style.height='43px';input.style.height=Math.min(input.scrollHeight,110)+'px'});
-  document.querySelectorAll('.riva-action').forEach(b=>b.onclick=()=>{input.value=b.dataset.q;input.focus()});
+/* ---------- messages ---------- */
+function emptyHtml(){return '<div class="empty"><div id="avWrap" class="float">'+AVATAR+'</div><h3>Hi Rishav, I\'m RIVA</h3><p>Your private assistant running on your own GPU. Ask anything, write code, or plan a project.</p><div class="chips"><button type="button" class="chip" data-prompt="Explain this simply: ">Explain something</button><button type="button" class="chip" data-prompt="Help me build a project: ">Build a project</button><button type="button" class="chip" data-prompt="Write clean, production-ready code for: ">Write code</button></div></div>'}
+function bub(role,text,ts){var u=role==='user';return '<div class="msg '+(u?'user':'ai')+'"><div class="av '+(u?'user':'ai')+'">'+(u?'R':'AI')+'</div><div class="body"><div class="bub">'+(u?esc(text):md(text))+'</div>'+(ts?'<div class="meta">'+new Date(ts).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})+'</div>':'')+'</div></div>'}
+function toBottom(){var x=$('#scroll');x.scrollTop=x.scrollHeight}
+function clearEmpty(){var e=document.querySelector('#scroll .empty');if(e)$('#scroll').innerHTML=''}
 
-  const SpeechRecognition=window.SpeechRecognition||window.webkitSpeechRecognition;
-  if(SpeechRecognition){
-    const recognition=new SpeechRecognition();recognition.lang=navigator.language||'en-US';recognition.interimResults=true;recognition.continuous=false;
-    recognition.onstart=()=>{mic.classList.add('active');status.textContent='Listening...'};
-    recognition.onend=()=>{mic.classList.remove('active');status.textContent='Online · Ready'};
-    recognition.onerror=()=>{mic.classList.remove('active');status.textContent='Voice error'};
-    recognition.onresult=e=>{let t='';for(let i=e.resultIndex;i<e.results.length;i++)t+=e.results[i][0].transcript;input.value=t;input.dispatchEvent(new Event('input'))};
-    mic.onclick=()=>{try{recognition.start()}catch(e){}};
-  }else mic.onclick=()=>{status.textContent='Voice input is not supported here'};
+/* ---------- streaming (shared by main + super chat) ---------- */
+function stream(payload,onText,onModel){
+  return fetch('/api/chat',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)}).then(function(res){
+    if(!res.ok)return res.json().catch(function(){return{}}).then(function(d){throw new Error(d.error||('Request failed ('+res.status+')'))});
+    var reader=res.body.getReader(),dec=new TextDecoder(),buf='';
+    function handle(line){
+      if(line.indexOf('data:')!==0)return;
+      var e;try{e=JSON.parse(line.slice(5).trim())}catch(x){return}
+      if(e.type==='delta')onText(e.text);
+      else if(e.type==='model'&&onModel)onModel(e.model);
+      else if(e.type==='error')throw new Error(e.message);
+    }
+    function pump(){return reader.read().then(function(r){
+      if(r.done){if(buf)handle(buf);return}
+      buf+=dec.decode(r.value,{stream:true});var parts=buf.split('\n');buf=parts.pop();parts.forEach(handle);return pump()})}
+    return pump();
+  });
+}
+
+function send(){
+  if(busy)return;
+  var ta=$('#ta'),text=ta.value.trim();
+  if(!text&&!attached)return;
+  var ready=cur?Promise.resolve():newChat(true);
+  ready.then(function(){
+    var payload=text;
+    if(attached)payload=(text?text+'\n\n':'')+'[Attached file: '+attached.name+']\n'+attached.body;
+    var shown=attached?(text+(text?'\n':'')+'📎 '+attached.name):text;
+    ta.value='';grow();clearAttach();clearEmpty();
+    $('#scroll').insertAdjacentHTML('beforeend',bub('user',shown));
+    $('#scroll').insertAdjacentHTML('beforeend','<div class="msg ai" id="sm"><div class="av ai">AI</div><div class="body"><div class="bub" id="sb"><span class="caret"></span></div><div class="meta" id="smeta">RIVA is thinking…</div></div></div>');
+    toBottom();busy=true;$('#send').disabled=true;$('#stState').textContent='generating…';
+    var last='';
+    stream({conversation_id:cur,message:payload,model:model},function(t){last=t;$('#sb').innerHTML=md(t)+'<span class="caret"></span>';$('#smeta').textContent='RIVA is typing…';toBottom()},setModelName)
+    .catch(function(e){$('#sb').innerHTML='<b>RIVA error:</b> '+esc(e.message);last=null})
+    .then(function(){var b=$('#sb');if(b&&last!==null)b.innerHTML=md(last);var m=$('#smeta');if(m)m.textContent='RIVA · '+new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+      var s=$('#sm');if(s)s.removeAttribute('id');if(b)b.removeAttribute('id');if(m)m.removeAttribute('id');
+      busy=false;$('#send').disabled=false;paintStatus();loadConvs(true);petGain(2)});
+  }).catch(toast);
+}
+
+/* ---------- conversations ---------- */
+function newChat(silent){return post('/api/conversations',{title:'New chat'}).then(function(c){
+  cur=c.id;convs=[c].concat(convs.filter(function(x){return x.id!==c.id}));renderHist();
+  $('#scroll').innerHTML=emptyHtml();resetModel();closeSide();if(!silent)view('chat');$('#ta').focus()})}
+function openConv(id){cur=id;renderHist();resetModel();closeSide();view('chat');
+  return api('/api/conversations/'+encodeURIComponent(id)+'/messages').then(function(ms){
+    $('#scroll').innerHTML=ms.length?ms.map(function(m){return bub(m.sender||m.role,m.content,m.created_at)}).join(''):emptyHtml();toBottom()})}
+function delConv(id){if(!confirm('Delete this chat?'))return;
+  api('/api/conversations/'+encodeURIComponent(id),{method:'DELETE'}).then(function(){
+    convs=convs.filter(function(c){return c.id!==id});
+    if(cur===id){cur=null;if(convs.length)openConv(convs[0].id);else newChat(true)}else renderHist()}).catch(toast)}
+function loadConvs(keep){return api('/api/conversations').then(function(d){
+  if(!Array.isArray(d))throw new Error('Invalid chat list');
+  var local=convs.filter(function(c){return c.id===cur&&!d.some(function(x){return x.id===c.id})});
+  convs=local.concat(d);renderHist();
+  if(!keep&&!cur){return convs.length?openConv(convs[0].id):newChat(true)}
+ }).catch(function(e){if(!cur){$('#scroll').innerHTML=emptyHtml()}toast(e)})}
+function renderHist(){var q=($('#search').value||'').toLowerCase();
+  var l=convs.filter(function(c){return(c.title||'').toLowerCase().indexOf(q)>-1});
+  $('#hist').innerHTML=l.length?l.map(function(c){return '<div class="hi '+(c.id===cur?'on':'')+'"><button type="button" class="open" data-open="'+esc(c.id)+'"><div class="t">'+esc(c.title||'Chat')+'</div><div class="d">'+new Date(c.created_at).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})+'</div></button><button type="button" class="del" data-del="'+esc(c.id)+'" aria-label="Delete chat">🗑</button></div>'}).join(''):'<div style="padding:12px;color:var(--mute);font-size:12px">No chats yet</div>'}
+
+/* ---------- model ---------- */
+var LBL={auto:'Auto',7:'7B','7b':'Qwen 7B','14b':'Qwen 14B'};
+function paintStatus(){
+  var n=model==='auto'?(modelName?'Auto · '+modelName:'Auto routing'):(model==='7b'?'Qwen 2.5 7B (pinned)':'Qwen 2.5 14B (pinned)');
+  $('#stModel').textContent=n;$('#mLbl').textContent=model==='auto'?'Auto':model.toUpperCase();
+  $('#stState').textContent=live?'server online':'server offline';
+  document.querySelectorAll('#menu button').forEach(function(b){b.classList.toggle('on',b.dataset.m===model)})}
+function setModelName(m){modelName=String(m||'').replace(/\*\*/g,'').slice(0,26);paintStatus()}
+function resetModel(){model='auto';modelName='';paintStatus()}
+function pickModel(v){$('#menu').classList.add('hidden');
+  if(!cur){model=v;paintStatus();return}
+  var prev=model;model=v;paintStatus();$('#stState').textContent='switching model…';
+  post('/api/model',{conversation_id:cur,model:v}).then(function(){paintStatus()}).catch(function(e){model=prev;paintStatus();toast(e)})}
+
+/* ---------- server ---------- */
+function refresh(){return api('/api/state').then(function(d){
+  live=!!(d.ping&&d.ping.live);var s=d.state||{},p=d.ping||{};
+  $('#sDot').className='dot'+(live?' live':'');$('#tDot').className='dot'+(live?' live':'');
+  $('#sTxt').textContent=live?'ONLINE':'OFFLINE';$('#sSub').textContent=live?'Kaggle ready':(p.reason||'unavailable');$('#tTxt').textContent=live?'Online':'Offline';
+  $('#bigS').textContent=live?'ONLINE':'OFFLINE';$('#subS').textContent=live?'Kaggle runtime is ready':(p.reason||'Runtime unreachable');
+  $('#desS').textContent=s.desired_state||'—';$('#latS').textContent=p.latencyMs!=null?p.latencyMs+' ms':'—';
+  $('#urlS').textContent=s.current_url||'No URL in app_state';$('#dbS').textContent=s.status||'—';paintStatus()
+ }).catch(function(){live=false;$('#sTxt').textContent='OFFLINE';paintStatus()})}
+function power(ds,btn){btn.disabled=true;post('/api/power',{desired_state:ds}).then(function(){toast(ds==='online'?'Starting Kaggle…':'Stopping Kaggle…')}).catch(toast).then(function(){btn.disabled=false;refresh()})}
+function loadStats(){api('/api/stats').then(function(d){$('#stats').innerHTML=[['Messages',d.msgs],['Memories',d.memories],['Facts',d.facts],['Doc chunks',d.chunks]].map(function(c){return '<div class="sr"><span>'+c[0]+'</span><span>'+(c[1]||0)+'</span></div>'}).join('')}).catch(function(){})}
+
+/* ---------- projects ---------- */
+function renderProjects(){var g=$('#pGrid');if(!projects.length){g.innerHTML='<div class="card glass"><h4>No projects yet</h4><p>Name a project above to start a dedicated chat for it.</p></div>';return}
+  g.innerHTML=projects.map(function(p,i){return '<div class="card glass"><h4>'+esc(p.name)+'</h4><p>Created '+new Date(p.created).toLocaleDateString()+'</p><div class="row" style="margin:12px 0 0"><button type="button" class="gbtn" data-popen="'+i+'" style="flex:1">Open chat</button><button type="button" class="gbtn" data-pdel="'+i+'">🗑</button></div></div>'}).join('')}
+function saveProjects(){try{localStorage.setItem('riva_projects',JSON.stringify(projects))}catch(e){}}
+
+/* ---------- attach ---------- */
+function onFile(f){if(!f)return;if(f.size>2*1024*1024){toast('File too large (2 MB max for text files)');return}
+  var r=new FileReader();r.onload=function(){var t=String(r.result||'');if(/\u0000/.test(t.slice(0,2000))){toast('Only text and code files can be read');return}
+    attached={name:f.name,body:t.slice(0,15000)};$('#attBox').className='';$('#attBox').innerHTML='<div class="att">📎 '+esc(f.name)+' <button type="button" id="attX" aria-label="Remove">✕</button></div>'};
+  r.onerror=function(){toast('Could not read file')};r.readAsText(f)}
+function clearAttach(){attached=null;$('#attBox').className='hidden';$('#attBox').innerHTML='';$('#file').value=''}
+
+/* ---------- views / sidebar ---------- */
+function view(v){document.querySelectorAll('#nav button').forEach(function(b){b.classList.toggle('on',b.dataset.view===v)});
+  ['chat','projects','server'].forEach(function(x){$('#v-'+x).classList.toggle('hidden',x!==v)});
+  $('#vTitle').textContent={chat:'Chat',projects:'Projects',server:'Server'}[v];
+  if(v==='server'){refresh();loadStats()}if(v==='projects')renderProjects();closeSide()}
+function openSide(){$('#side').classList.add('open');$('#scrim').classList.remove('hidden')}
+function closeSide(){$('#side').classList.remove('open');$('#scrim').classList.add('hidden')}
+function grow(){var t=$('#ta');t.style.height='auto';t.style.height=Math.min(t.scrollHeight,Math.round(window.innerHeight*.42))+'px'}
+
+/* ---------- super chat (instant mini window) ---------- */
+var sBusy=false,sHist=[];
+function sRender(){$('#sMsgs').innerHTML=sHist.length?sHist.map(function(m){return '<div class="m '+m.r+'">'+(m.r==='u'?esc(m.t):md(m.t))+'</div>'}).join(''):'<div style="color:var(--mute);font-size:12px;text-align:center;margin-top:30px">Instant chat with RIVA.<br>Quick questions, no history clutter.</div>';$('#sMsgs').scrollTop=1e9}
+function sSend(){if(sBusy)return;var i=$('#sIn'),t=i.value.trim();if(!t)return;i.value='';sHist.push({r:'u',t:t});var a={r:'a',t:'…'};sHist.push(a);sRender();sBusy=true;avatarState('think');
+  stream({conversation_id:SUPER_ID,message:t,model:model},function(x){a.t=x;sRender();avatarState('talk')},null).catch(function(e){a.t='Error: '+e.message;sRender()}).then(function(){sBusy=false;avatarState('idle');sRender();petGain(1)})}
+
+/* ---------- virtual pet ---------- */
+var pet={name:'Riv',hunger:70,mood:70,xp:0,t:Date.now()},petTimer=null;
+function petLoad(){try{var p=JSON.parse(localStorage.getItem('riva_pet')||'null');if(p)pet=p}catch(e){}
+  var h=(Date.now()-(pet.t||Date.now()))/36e5;pet.hunger=Math.max(0,pet.hunger-h*6);pet.mood=Math.max(0,pet.mood-h*3);petDraw()}
+function petSave(){pet.t=Date.now();try{localStorage.setItem('riva_pet',JSON.stringify(pet))}catch(e){}}
+function petFaceFor(){return pet.hunger<25?'😿':pet.mood<35?'😾':pet.mood>80?'😻':'🐱'}
+function petDraw(){$('#petFace').textContent=petFaceFor();$('#petBar').style.width=Math.round((pet.hunger+pet.mood)/2)+'%';
+  $('#pM').textContent=Math.round(pet.mood)+'%';$('#pH').textContent=Math.round(pet.hunger)+'%';$('#pL').textContent=1+Math.floor(pet.xp/20)}
+function petSay(t){var s=$('#petSay');s.textContent=t;s.classList.remove('hidden');clearTimeout(petSay.h);petSay.h=setTimeout(function(){s.classList.add('hidden')},2600)}
+function petGain(x){pet.xp+=x;pet.mood=Math.min(100,pet.mood+x);petDraw();petSave()}
+function petAct(k){if(k==='feed'){pet.hunger=Math.min(100,pet.hunger+30);petSay('Yum! 🍖')}else if(k==='play'){pet.mood=Math.min(100,pet.mood+25);pet.hunger=Math.max(0,pet.hunger-8);pet.xp+=3;petSay('Wheee! 🎾')}else{pet.mood=Math.min(100,pet.mood+10);petSay('zzz… 💤')}petDraw();petSave()}
+
+/* ---------- wiring ---------- */
+function bind(){
+  var ta=$('#ta');
+  ta.addEventListener('input',grow);
+  ta.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();send()}});
+  $('#send').addEventListener('click',send);
+  $('#newChatBtn').addEventListener('click',function(){newChat().catch(toast)});
+  $('#attBtn').addEventListener('click',function(){$('#file').click()});
+  $('#file').addEventListener('change',function(e){onFile(e.target.files[0])});
+  $('#mBtn').addEventListener('click',function(e){e.stopPropagation();$('#menu').classList.toggle('hidden')});
+  $('#search').addEventListener('input',renderHist);
+  $('#burger').addEventListener('click',openSide);$('#scrim').addEventListener('click',closeSide);
+  $('#pAdd').addEventListener('click',function(){var n=$('#pName').value.trim();if(!n)return;projects.unshift({name:n,created:Date.now()});$('#pName').value='';saveProjects();renderProjects()});
+  $('#pName').addEventListener('keydown',function(e){if(e.key==='Enter')$('#pAdd').click()});
+  $('#superBtn').addEventListener('click',function(){$('#super').classList.toggle('hidden');sRender();if(!$('#super').classList.contains('hidden'))setTimeout(function(){$('#sIn').focus()},50)});
+  $('#sClose').addEventListener('click',function(){$('#super').classList.add('hidden')});
+  $('#sClear').addEventListener('click',function(){sHist=[];sRender()});
+  $('#sGo').addEventListener('click',sSend);
+  $('#sIn').addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.isComposing){e.preventDefault();sSend()}});
+  $('#petBtn').addEventListener('click',function(){var p=$('#pet');p.classList.toggle('hidden');if(!p.classList.contains('hidden'))petSay('Hi Rishav! 🐾');else $('#petPanel').classList.add('hidden')});
+  $('#petFace').addEventListener('click',function(){$('#petPanel').classList.toggle('hidden');petGain(1);petSay(['Purr…','Meow!','Pet me more!'][Math.floor(Math.random()*3)])});
+  $('#pFeed').addEventListener('click',function(){petAct('feed')});$('#pPlay').addEventListener('click',function(){petAct('play')});$('#pNap').addEventListener('click',function(){petAct('nap')});
+  document.querySelectorAll('#nav button').forEach(function(b){b.addEventListener('click',function(){view(b.dataset.view)})});
+  document.querySelectorAll('[data-power]').forEach(function(b){b.addEventListener('click',function(){power(b.dataset.power,b)})});
+  document.querySelectorAll('#menu button').forEach(function(b){b.addEventListener('click',function(){pickModel(b.dataset.m)})});
+  document.addEventListener('click',function(e){
+    var t=e.target,c=t.closest?t.closest.bind(t):null;if(!c)return;
+    if(!c('.menu')&&!c('#mBtn'))$('#menu').classList.add('hidden');
+    var o=c('[data-open]');if(o){openConv(o.getAttribute('data-open')).catch(toast);return}
+    var d=c('[data-del]');if(d){delConv(d.getAttribute('data-del'));return}
+    var ch=c('.chip[data-prompt]');if(ch){ta.value=ch.getAttribute('data-prompt');ta.focus();grow();return}
+    var po=c('[data-popen]');if(po){var p=projects[+po.getAttribute('data-popen')];if(p){newChat(false).then(function(){ta.value='Work on project: '+p.name+'. ';ta.focus();grow()}).catch(toast)}return}
+    var pd=c('[data-pdel]');if(pd){projects.splice(+pd.getAttribute('data-pdel'),1);saveProjects();renderProjects();return}
+    if(c('#attX'))clearAttach();
+  });
+}
+function init(){
+  try{projects=JSON.parse(localStorage.getItem('riva_projects')||'[]')}catch(e){projects=[]}
+  $('#scroll').innerHTML=emptyHtml();
+  bind();petLoad();paintStatus();renderProjects();
+  refresh();loadConvs(false);
+  setInterval(refresh,30000);setInterval(function(){pet.hunger=Math.max(0,pet.hunger-1);pet.mood=Math.max(0,pet.mood-.6);petDraw();petSave()},60000);
+}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',init);else init();
 })();
 </script>
-</body>
-</html>`;
+</body></html>`;
